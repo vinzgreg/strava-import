@@ -1,0 +1,23 @@
+# Strava data exports — contain personal GPS and health data
+Strava Dump */
+strava_dump*/
+
+# Databases
+*.db
+*.db-shm
+*.db-wal
+*.db.bak-*
+
+# GPX / activity files
+*.gpx
+*.fit
+*.fit.gz
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
