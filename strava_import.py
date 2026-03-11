@@ -83,6 +83,153 @@ def _normalize_ts(ts: str | None) -> str | None:
     return s
 
 
+def _parse_ts(ts: str | None) -> datetime | None:
+    """Parse a timestamp string to a naive datetime for time-delta arithmetic."""
+    if not ts:
+        return None
+    s = ts.strip().replace(" ", "T").rstrip("Z")
+    for sep in ("+", "-"):
+        idx = s.find(sep, 10)
+        if idx != -1:
+            s = s[:idx]
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            pass
+    return None
+
+
+def _fuzzy_time_match(
+    existing_list: list[dict],
+    claimed_ids: set[int],
+    strava_local: str | None,
+    strava_utc: str | None,
+    strava_name: str,
+    strava_duration_s: float | None,
+    window_h: float = 2.0,
+) -> dict | None:
+    """Return the best-matching existing activity using a fuzzy time window.
+
+    Acceptance criteria (to avoid false positives):
+      - time delta ≤ 1 h  →  accepted on time alone (covers DST ± UTC±1)
+      - time delta ≤ 2 h  →  accepted only when duration OR name also match
+
+    Among accepted candidates the one with the highest score is returned.
+    Already-claimed entries (fuzzy-matched earlier in this run) are skipped.
+    """
+    strava_dts = [dt for dt in (_parse_ts(strava_local), _parse_ts(strava_utc)) if dt is not None]
+    if not strava_dts:
+        return None
+
+    best: dict | None = None
+    best_score = -1.0
+
+    s_words = {w.lower() for w in strava_name.split() if len(w) >= 4}
+
+    for ex in existing_list:
+        if ex["id"] in claimed_ids:
+            continue
+
+        ex_dts = [
+            dt for dt in (_parse_ts(ex["start_time_local"]), _parse_ts(ex["start_time_utc"]))
+            if dt is not None
+        ]
+
+        # Minimum time delta across all (strava_ts, existing_ts) pairs
+        min_delta_h: float | None = None
+        for s_dt in strava_dts:
+            for e_dt in ex_dts:
+                dh = abs((s_dt - e_dt).total_seconds()) / 3600.0
+                if min_delta_h is None or dh < min_delta_h:
+                    min_delta_h = dh
+
+        if min_delta_h is None or min_delta_h > window_h:
+            continue
+
+        # Duration corroboration
+        ex_dur = ex.get("elapsed_s")
+        duration_match = False
+        if strava_duration_s and ex_dur:
+            rel = abs(strava_duration_s - ex_dur) / max(strava_duration_s, ex_dur)
+            duration_match = rel < 0.10  # within 10 %
+
+        # Name corroboration (shared words of ≥ 4 chars)
+        e_words = {w.lower() for w in (ex.get("activity_name") or "").split() if len(w) >= 4}
+        name_match = bool(s_words & e_words)
+
+        # Acceptance gate
+        if min_delta_h > 1.0 and not duration_match and not name_match:
+            continue
+
+        score = (2.0 - min_delta_h) + (3.0 if duration_match else 0.0) + (2.0 if name_match else 0.0)
+        if score > best_score:
+            best_score = score
+            best = ex
+
+    return best
+
+
+def _find_missing_file_candidates(
+    existing_list: list[dict],
+    exclude_ids: set[int],
+    strava_local: str | None,
+    strava_utc: str | None,
+    strava_name: str,
+    strava_duration_s: float | None,
+    is_fit: bool,
+    window_h: float = 2.0,
+) -> list[dict]:
+    """Return all existing entries within window_h that are missing the relevant file path.
+
+    Uses the same ±2 h acceptance criteria as _fuzzy_time_match.
+    Entries in exclude_ids (already matched / already backfilled) are skipped.
+    """
+    strava_dts = [dt for dt in (_parse_ts(strava_local), _parse_ts(strava_utc)) if dt is not None]
+    if not strava_dts:
+        return []
+
+    file_key = "fit_path" if is_fit else "gpx_path"
+    s_words = {w.lower() for w in strava_name.split() if len(w) >= 4}
+    results = []
+
+    for ex in existing_list:
+        if ex["id"] in exclude_ids:
+            continue
+        if ex.get(file_key):
+            continue  # already has the file
+
+        ex_dts = [
+            dt for dt in (_parse_ts(ex["start_time_local"]), _parse_ts(ex["start_time_utc"]))
+            if dt is not None
+        ]
+
+        min_delta_h: float | None = None
+        for s_dt in strava_dts:
+            for e_dt in ex_dts:
+                dh = abs((s_dt - e_dt).total_seconds()) / 3600.0
+                if min_delta_h is None or dh < min_delta_h:
+                    min_delta_h = dh
+
+        if min_delta_h is None or min_delta_h > window_h:
+            continue
+
+        ex_dur = ex.get("elapsed_s")
+        duration_match = (
+            bool(strava_duration_s and ex_dur and
+                 abs(strava_duration_s - ex_dur) / max(strava_duration_s, ex_dur) < 0.10)
+        )
+        e_words = {w.lower() for w in (ex.get("activity_name") or "").split() if len(w) >= 4}
+        name_match = bool(s_words & e_words)
+
+        if min_delta_h > 1.0 and not duration_match and not name_match:
+            continue
+
+        results.append(ex)
+
+    return results
+
+
 def _float(s: str) -> float | None:
     s = s.strip()
     if not s:
@@ -277,18 +424,18 @@ def _resolve_duplicate(
     detail_parts: list[str] = []
 
     if is_fit:
-        if not existing.get("fit_path") and fit_dest:
-            dest = fit_dest / gpx_src.name
-            if not dest.exists() or overwrite:
-                if not dry_run:
+        if not existing.get("fit_path"):
+            dest = (fit_dest / gpx_src.name) if fit_dest else gpx_src
+            if dest == gpx_src or not dest.exists() or overwrite:
+                if not dry_run and dest != gpx_src:
                     shutil.copy2(gpx_src, dest)
                 updates["fit_path"] = str(dest)
                 detail_parts.append(f"FIT → {dest.name}")
     else:
-        if not existing.get("gpx_path") and gpx_dest:
-            dest = gpx_dest / gpx_src.name
-            if not dest.exists() or overwrite:
-                if not dry_run:
+        if not existing.get("gpx_path"):
+            dest = (gpx_dest / gpx_src.name) if gpx_dest else gpx_src
+            if dest == gpx_src or not dest.exists() or overwrite:
+                if not dry_run and dest != gpx_src:
                     shutil.copy2(gpx_src, dest)
                 updates["gpx_path"] = str(dest)
                 detail_parts.append(f"GPX → {dest.name}")
@@ -395,17 +542,25 @@ def import_activities(
         "SELECT 1 FROM pragma_table_info('activities') WHERE name='fit_path'"
     ).fetchone())
     _select = (
-        "SELECT garmin_activity_id, id, gpx_path, fit_path, start_time_local, start_time_utc "
+        "SELECT garmin_activity_id, id, gpx_path, fit_path, start_time_local, start_time_utc,"
+        "       activity_name, elapsed_time_s "
         "FROM activities WHERE user_id = ?"
         if _has_fit_path else
-        "SELECT garmin_activity_id, id, gpx_path, NULL, start_time_local, start_time_utc "
+        "SELECT garmin_activity_id, id, gpx_path, NULL, start_time_local, start_time_utc,"
+        "       activity_name, elapsed_time_s "
         "FROM activities WHERE user_id = ?"
     )
     existing_by_id: dict[str, dict] = {}
     existing_by_time: dict[str, dict] = {}
+    existing_list: list[dict] = []          # for fuzzy time matching
     for r in conn.execute(_select, (user_id,)):
-        entry = {"id": r[1], "gpx_path": r[2], "fit_path": r[3]}
+        entry = {
+            "id": r[1], "gpx_path": r[2], "fit_path": r[3],
+            "start_time_local": r[4], "start_time_utc": r[5],
+            "activity_name": r[6], "elapsed_s": r[7],
+        }
         existing_by_id[r[0]] = entry
+        existing_list.append(entry)
         # Index by both local and UTC timestamps (normalised) so we match
         # regardless of which one Strava's date_local actually corresponds to.
         for raw_ts in (r[4], r[5]):
@@ -413,6 +568,7 @@ def import_activities(
             if norm and norm not in existing_by_time:
                 existing_by_time[norm] = entry
     existing_ids: set[str] = set(existing_by_id.keys())
+    fuzzy_claimed_ids: set[int] = set()     # DB row ids claimed by a fuzzy match this run
 
     if not dry_run and gpx_dest:
         gpx_dest.mkdir(parents=True, exist_ok=True)
@@ -420,7 +576,7 @@ def import_activities(
         fit_dest.mkdir(parents=True, exist_ok=True)
 
     # Counters
-    n_new = n_skipped_complete = n_completed = n_date_filtered = n_gpx_missing = n_parse_error = n_gpx_skipped = 0
+    n_new = n_skipped_complete = n_completed = n_fuzzy = n_date_filtered = n_gpx_missing = n_parse_error = n_gpx_skipped = 0
     # Collect issues for dry-run report
     issues: list[str] = []
 
@@ -452,7 +608,13 @@ def import_activities(
                     n_date_filtered += 1
                     continue
 
-            # --- duplicate check (by ID, then by normalised start time) ---
+            # --- activity file info (shared by duplicate and new-insert paths) ---
+            gpx_rel = d["gpx_rel"]
+            gpx_src = dump_dir / gpx_rel if gpx_rel else None
+            is_fit = (gpx_rel.endswith(".fit") or gpx_rel.endswith(".fit.gz")) if gpx_rel else False
+
+            # --- duplicate check (by ID, then exact time, then fuzzy time) ---
+            is_fuzzy_match = False
             existing = existing_by_id.get(d["garmin_activity_id"])
             if existing is None:
                 for ts in (d["start_local"], d["start_utc"]):
@@ -461,42 +623,76 @@ def import_activities(
                         existing = existing_by_time[norm]
                         existing_ids.add(d["garmin_activity_id"])
                         break
+            if existing is None:
+                existing = _fuzzy_time_match(
+                    existing_list, fuzzy_claimed_ids,
+                    d["start_local"], d["start_utc"],
+                    d["activity_name"], d["elapsed_s"],
+                )
+                if existing is not None:
+                    is_fuzzy_match = True
+                    existing_ids.add(d["garmin_activity_id"])
+                    fuzzy_claimed_ids.add(existing["id"])
 
             if d["garmin_activity_id"] in existing_ids:
                 if existing is not None:
-                    gpx_rel_dup = d["gpx_rel"]
-                    gpx_src_dup = dump_dir / gpx_rel_dup if gpx_rel_dup else None
-                    is_fit_dup = (
-                        gpx_rel_dup.endswith(".fit") or gpx_rel_dup.endswith(".fit.gz")
-                    ) if gpx_rel_dup else False
                     status, detail = _resolve_duplicate(
-                        conn, existing, gpx_src_dup, is_fit_dup,
+                        conn, existing, gpx_src, is_fit,
                         gpx_dest, fit_dest, overwrite_gpx, dry_run,
                     )
+                    tag = "FUZZY MATCH " if is_fuzzy_match else "COMPLETED   "
                     if status == "completed":
                         n_completed += 1
-                        msg = (f"COMPLETED    {d['activity_name']!r:50s} {d['start_local']}"
+                        if is_fuzzy_match:
+                            n_fuzzy += 1
+                        msg = (f"{tag} {d['activity_name']!r:50s} {d['start_local']}"
                                f"  ({detail})")
                         print(f"  {msg}")
                         issues.append(msg)
                     else:
                         n_skipped_complete += 1
+                        if is_fuzzy_match:
+                            n_fuzzy += 1
                         if dry_run:
+                            tag2 = "FUZZY DUP   " if is_fuzzy_match else "DUPLICATE   "
                             issues.append(
-                                f"DUPLICATE    {d['activity_name']!r:50s} {d['start_local']}"
+                                f"{tag2} {d['activity_name']!r:50s} {d['start_local']}"
                             )
+
+                    # --- secondary backfill: other DB entries at same time missing file ---
+                    # This catches Garmin-native entries (different ID, no file) that
+                    # represent the same real-world activity as this Strava record.
+                    if gpx_src and gpx_src.exists():
+                        exclude = fuzzy_claimed_ids | {existing["id"]}
+                        for cand in _find_missing_file_candidates(
+                            existing_list, exclude,
+                            d["start_local"], d["start_utc"],
+                            d["activity_name"], d["elapsed_s"],
+                            is_fit,
+                        ):
+                            sec_status, sec_detail = _resolve_duplicate(
+                                conn, cand, gpx_src, is_fit,
+                                gpx_dest, fit_dest, overwrite_gpx, dry_run,
+                            )
+                            if sec_status == "completed":
+                                n_completed += 1
+                                fuzzy_claimed_ids.add(cand["id"])
+                                msg = (
+                                    f"BACKFILLED   {cand.get('activity_name')!r:50s}"
+                                    f"  via:{d['activity_name']!r} {d['start_local']}"
+                                    f"  ({sec_detail})"
+                                )
+                                print(f"  {msg}")
+                                issues.append(msg)
                 else:
                     # inserted during this run — can't look up row, just skip
                     n_skipped_complete += 1
                 continue
 
-            # --- activity file (GPX or FIT) ---
-            gpx_rel = d["gpx_rel"]
-            gpx_src = dump_dir / gpx_rel if gpx_rel else None
+            # --- new-activity file handling ---
             gpx_dest_path: str | None = None
             fit_dest_path: str | None = None
             gpx_will_collide = False
-            is_fit = gpx_rel.endswith(".fit") or gpx_rel.endswith(".fit.gz") if gpx_rel else False
 
             if gpx_src and gpx_src.exists():
                 target_dir = fit_dest if is_fit else gpx_dest
@@ -611,22 +807,24 @@ def import_activities(
                 print(f"  {issue}")
             print()
         print("Summary:")
-        print(f"  Would import         : {n_new}")
-        print(f"  Skipped (complete)   : {n_skipped_complete}  (already in DB with all files)")
+        print(f"  Would import          : {n_new}")
+        print(f"  Skipped (complete)    : {n_skipped_complete}  (already in DB with all files)")
         print(f"  Completed (file added): {n_completed}  (was in DB, missing GPX/FIT added)")
-        print(f"  Outside dates        : {n_date_filtered}  (filtered out)")
-        print(f"  File missing         : {n_gpx_missing}  (activity imported, no file to copy)")
-        print(f"  File name conflict   : {n_gpx_skipped}  (existing file preserved; use --overwrite-gpx to replace)")
-        print(f"  Parse errors         : {n_parse_error}  (would skip)")
+        print(f"    of which fuzzy match: {n_fuzzy}  (matched via ±2 h time window)")
+        print(f"  Outside dates         : {n_date_filtered}  (filtered out)")
+        print(f"  File missing          : {n_gpx_missing}  (activity imported, no file to copy)")
+        print(f"  File name conflict    : {n_gpx_skipped}  (existing file preserved; use --overwrite-gpx to replace)")
+        print(f"  Parse errors          : {n_parse_error}  (would skip)")
     else:
         print(f"\nDone.")
-        print(f"  Imported             : {n_new}")
-        print(f"  Skipped (complete)   : {n_skipped_complete}  (already in DB with all files)")
+        print(f"  Imported              : {n_new}")
+        print(f"  Skipped (complete)    : {n_skipped_complete}  (already in DB with all files)")
         print(f"  Completed (file added): {n_completed}  (was in DB, missing GPX/FIT added)")
-        print(f"  Outside dates        : {n_date_filtered}  (filtered out)")
-        print(f"  File missing         : {n_gpx_missing}")
-        print(f"  File name conflict   : {n_gpx_skipped}  (existing file preserved)")
-        print(f"  Errors               : {n_parse_error}")
+        print(f"    of which fuzzy match: {n_fuzzy}  (matched via ±2 h time window)")
+        print(f"  Outside dates         : {n_date_filtered}  (filtered out)")
+        print(f"  File missing          : {n_gpx_missing}")
+        print(f"  File name conflict    : {n_gpx_skipped}  (existing file preserved)")
+        print(f"  Errors                : {n_parse_error}")
 
 
 # ---------------------------------------------------------------------------
