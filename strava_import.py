@@ -182,8 +182,10 @@ def init_schema(conn: sqlite3.Connection) -> None:
             start_lon               REAL,
             raw_json                TEXT,
             gpx_path                TEXT,
+            fit_path                TEXT,
             caldav_pushed           INTEGER NOT NULL DEFAULT 0,
             mastodon_posted         INTEGER NOT NULL DEFAULT 0,
+            source                  TEXT,
             synced_at               TEXT    NOT NULL,
             UNIQUE(user_id, garmin_activity_id)
         );
@@ -213,8 +215,78 @@ def check_prerequisites(conn: sqlite3.Connection, user_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Schema migration
+# ---------------------------------------------------------------------------
+
+def migrate_schema(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after the initial schema version, if missing."""
+    for stmt in (
+        "ALTER TABLE activities ADD COLUMN fit_path TEXT",
+        "ALTER TABLE activities ADD COLUMN source TEXT",
+    ):
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass  # column already exists
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
 # Core import logic
 # ---------------------------------------------------------------------------
+
+
+def _resolve_duplicate(
+    conn: sqlite3.Connection,
+    existing: dict,
+    gpx_src: Path | None,
+    is_fit: bool,
+    gpx_dest: Path | None,
+    fit_dest: Path | None,
+    overwrite: bool,
+    dry_run: bool,
+) -> tuple[str, str | None]:
+    """Check whether a duplicate activity is missing a file path and fill it in.
+
+    Returns (status, detail):
+      status  — 'complete'  (nothing to add)
+              — 'completed' (file path(s) added / would be added in dry-run)
+      detail  — human-readable description of what was added, or None.
+    """
+    if gpx_src is None or not gpx_src.exists():
+        return "complete", None
+
+    updates: dict[str, str] = {}
+    detail_parts: list[str] = []
+
+    if is_fit:
+        if not existing.get("fit_path") and fit_dest:
+            dest = fit_dest / gpx_src.name
+            if not dest.exists() or overwrite:
+                if not dry_run:
+                    shutil.copy2(gpx_src, dest)
+                updates["fit_path"] = str(dest)
+                detail_parts.append(f"FIT → {dest.name}")
+    else:
+        if not existing.get("gpx_path") and gpx_dest:
+            dest = gpx_dest / gpx_src.name
+            if not dest.exists() or overwrite:
+                if not dry_run:
+                    shutil.copy2(gpx_src, dest)
+                updates["gpx_path"] = str(dest)
+                detail_parts.append(f"GPX → {dest.name}")
+
+    if updates and not dry_run:
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        conn.execute(
+            f"UPDATE activities SET {set_clause} WHERE id = ?",
+            (*updates.values(), existing["id"]),
+        )
+        conn.commit()
+
+    if updates:
+        return "completed", " + ".join(detail_parts)
+    return "complete", None
 
 def _parse_row(row: list[str]) -> dict:
     """Extract and type-convert all fields from a CSV row. Returns a dict."""
@@ -223,7 +295,7 @@ def _parse_row(row: list[str]) -> dict:
     return {
         "activity_id":      activity_id,
         "garmin_activity_id": f"strava_{activity_id}",
-        "activity_name":    f"[Strava] {name_raw}" if name_raw else "[Strava]",
+        "activity_name":    name_raw if name_raw else "(no name)",
         "activity_type":    col(row, "type"),
         "description":      col(row, "description"),
         "start_local":      parse_local_date(col(row, "date_local")),
@@ -258,6 +330,7 @@ def import_activities(
     dump_dir: Path,
     db_path: Path,
     gpx_dest: Path | None,
+    fit_dest: Path | None,
     start_date: datetime | None,
     end_date: datetime | None,
     user_id: int,
@@ -297,21 +370,36 @@ def import_activities(
             conn.execute("INSERT OR IGNORE INTO users (id, name) VALUES (?, 'default')", (user_id,))
             conn.commit()
         check_prerequisites(conn, user_id)
+        migrate_schema(conn)
 
-    # Pre-fetch all strava IDs already in the DB for this user so we can
-    # detect duplicates without attempting an INSERT.
-    existing_ids: set[str] = {
-        r[0]
-        for r in conn.execute(
-            "SELECT garmin_activity_id FROM activities WHERE user_id = ?", (user_id,)
-        )
-    }
+    # Pre-load existing activities for duplicate detection (by ID and by time).
+    # Gracefully handle DBs that predate the fit_path column.
+    _has_fit_path = bool(conn.execute(
+        "SELECT 1 FROM pragma_table_info('activities') WHERE name='fit_path'"
+    ).fetchone())
+    _select = (
+        "SELECT garmin_activity_id, id, gpx_path, fit_path, start_time_local "
+        "FROM activities WHERE user_id = ?"
+        if _has_fit_path else
+        "SELECT garmin_activity_id, id, gpx_path, NULL, start_time_local "
+        "FROM activities WHERE user_id = ?"
+    )
+    existing_by_id: dict[str, dict] = {}
+    existing_by_time: dict[str, dict] = {}
+    for r in conn.execute(_select, (user_id,)):
+        entry = {"id": r[1], "gpx_path": r[2], "fit_path": r[3]}
+        existing_by_id[r[0]] = entry
+        if r[4]:
+            existing_by_time[r[4]] = entry
+    existing_ids: set[str] = set(existing_by_id.keys())
 
     if not dry_run and gpx_dest:
         gpx_dest.mkdir(parents=True, exist_ok=True)
+    if not dry_run and fit_dest:
+        fit_dest.mkdir(parents=True, exist_ok=True)
 
     # Counters
-    n_new = n_duplicate = n_date_filtered = n_gpx_missing = n_parse_error = n_gpx_skipped = 0
+    n_new = n_skipped_complete = n_completed = n_date_filtered = n_gpx_missing = n_parse_error = n_gpx_skipped = 0
     # Collect issues for dry-run report
     issues: list[str] = []
 
@@ -343,38 +431,72 @@ def import_activities(
                     n_date_filtered += 1
                     continue
 
-            # --- duplicate check ---
+            # --- duplicate check (by ID, then by start time) ---
+            existing = existing_by_id.get(d["garmin_activity_id"])
+            if existing is None and d["start_local"] and d["start_local"] in existing_by_time:
+                existing = existing_by_time[d["start_local"]]
+                existing_ids.add(d["garmin_activity_id"])
+
             if d["garmin_activity_id"] in existing_ids:
-                n_duplicate += 1
-                if dry_run:
-                    issues.append(
-                        f"DUPLICATE    {d['activity_name']!r:50s} {d['start_local']}"
+                if existing is not None:
+                    gpx_rel_dup = d["gpx_rel"]
+                    gpx_src_dup = dump_dir / gpx_rel_dup if gpx_rel_dup else None
+                    is_fit_dup = (
+                        gpx_rel_dup.endswith(".fit") or gpx_rel_dup.endswith(".fit.gz")
+                    ) if gpx_rel_dup else False
+                    status, detail = _resolve_duplicate(
+                        conn, existing, gpx_src_dup, is_fit_dup,
+                        gpx_dest, fit_dest, overwrite_gpx, dry_run,
                     )
+                    if status == "completed":
+                        n_completed += 1
+                        msg = (f"COMPLETED    {d['activity_name']!r:50s} {d['start_local']}"
+                               f"  ({detail})")
+                        print(f"  {msg}")
+                        issues.append(msg)
+                    else:
+                        n_skipped_complete += 1
+                        if dry_run:
+                            issues.append(
+                                f"DUPLICATE    {d['activity_name']!r:50s} {d['start_local']}"
+                            )
+                else:
+                    # inserted during this run — can't look up row, just skip
+                    n_skipped_complete += 1
                 continue
 
-            # --- GPX ---
+            # --- activity file (GPX or FIT) ---
             gpx_rel = d["gpx_rel"]
             gpx_src = dump_dir / gpx_rel if gpx_rel else None
             gpx_dest_path: str | None = None
+            fit_dest_path: str | None = None
             gpx_will_collide = False
+            is_fit = gpx_rel.endswith(".fit") or gpx_rel.endswith(".fit.gz") if gpx_rel else False
 
             if gpx_src and gpx_src.exists():
-                if gpx_dest:
-                    dest_file = gpx_dest / gpx_src.name
-                    gpx_dest_path = str(dest_file)
+                target_dir = fit_dest if is_fit else gpx_dest
+                if target_dir:
+                    dest_file = target_dir / gpx_src.name
+                    if is_fit:
+                        fit_dest_path = str(dest_file)
+                    else:
+                        gpx_dest_path = str(dest_file)
                     if dest_file.exists() and not overwrite_gpx:
                         gpx_will_collide = True
                         n_gpx_skipped += 1
                         issues.append(
-                            f"GPX EXISTS   {d['activity_name']!r:50s} {d['start_local']}  "
+                            f"FILE EXISTS  {d['activity_name']!r:50s} {d['start_local']}  "
                             f"({dest_file.name} already in dest — use --overwrite-gpx to replace)"
                         )
                 else:
-                    gpx_dest_path = str(gpx_src)
+                    if is_fit:
+                        fit_dest_path = str(gpx_src)
+                    else:
+                        gpx_dest_path = str(gpx_src)
             elif gpx_rel:
                 n_gpx_missing += 1
                 issues.append(
-                    f"GPX MISSING  {d['activity_name']!r:50s} {d['start_local']}  "
+                    f"FILE MISSING {d['activity_name']!r:50s} {d['start_local']}  "
                     f"({gpx_src})"
                 )
 
@@ -386,9 +508,12 @@ def import_activities(
             # --- real insert ---
             start_lat, start_lon = None, None
             if gpx_src and gpx_src.exists():
-                start_lat, start_lon = extract_gpx_start(gpx_src)
-                if gpx_dest and not gpx_will_collide:
-                    shutil.copy2(gpx_src, gpx_dest / gpx_src.name)
+                if not is_fit:
+                    start_lat, start_lon = extract_gpx_start(gpx_src)
+                if not gpx_will_collide:
+                    target_dir = fit_dest if is_fit else gpx_dest
+                    if target_dir:
+                        shutil.copy2(gpx_src, target_dir / gpx_src.name)
 
             raw_json = json.dumps(
                 {"strava_description": d["description"], "strava_activity_id": d["activity_id"]},
@@ -414,11 +539,11 @@ def import_activities(
                         calories, steps,
                         avg_temperature_c, max_temperature_c,
                         start_lat, start_lon,
-                        raw_json, gpx_path,
+                        raw_json, gpx_path, fit_path, source,
                         synced_at
                     ) VALUES (
                         ?,?,  ?,?,?,  ?,?,  ?,?,?,  ?,?,?,  ?,?,  ?,?,
-                        ?,?,  ?,?,?,  ?,?,  ?,?,  ?,?,  ?,?,  ?,?,  ?,?,  ?
+                        ?,?,  ?,?,?,  ?,?,  ?,?,  ?,?,  ?,?,  ?,?,  ?,?,?,?,  ?
                     )
                     """,
                     (
@@ -436,7 +561,7 @@ def import_activities(
                         d["calories"], d["steps"],
                         d["avg_temp"], d["max_temp"],
                         start_lat, start_lon,
-                        raw_json, gpx_dest_path,
+                        raw_json, gpx_dest_path, fit_dest_path, "Strava-Import",
                         synced_at,
                     ),
                 )
@@ -461,20 +586,22 @@ def import_activities(
                 print(f"  {issue}")
             print()
         print("Summary:")
-        print(f"  Would import      : {n_new}")
-        print(f"  Already in DB     : {n_duplicate}  (would skip)")
-        print(f"  Outside dates     : {n_date_filtered}  (filtered out)")
-        print(f"  GPX missing       : {n_gpx_missing}  (activity imported, no GPX copy)")
-        print(f"  GPX name conflict : {n_gpx_skipped}  (existing file preserved; use --overwrite-gpx to replace)")
-        print(f"  Parse errors      : {n_parse_error}  (would skip)")
+        print(f"  Would import         : {n_new}")
+        print(f"  Skipped (complete)   : {n_skipped_complete}  (already in DB with all files)")
+        print(f"  Completed (file added): {n_completed}  (was in DB, missing GPX/FIT added)")
+        print(f"  Outside dates        : {n_date_filtered}  (filtered out)")
+        print(f"  File missing         : {n_gpx_missing}  (activity imported, no file to copy)")
+        print(f"  File name conflict   : {n_gpx_skipped}  (existing file preserved; use --overwrite-gpx to replace)")
+        print(f"  Parse errors         : {n_parse_error}  (would skip)")
     else:
         print(f"\nDone.")
-        print(f"  Imported          : {n_new}")
-        print(f"  Already in DB     : {n_duplicate}  (skipped)")
-        print(f"  Outside dates     : {n_date_filtered}  (filtered out)")
-        print(f"  GPX missing       : {n_gpx_missing}")
-        print(f"  GPX name conflict : {n_gpx_skipped}  (existing file preserved)")
-        print(f"  Errors            : {n_parse_error}")
+        print(f"  Imported             : {n_new}")
+        print(f"  Skipped (complete)   : {n_skipped_complete}  (already in DB with all files)")
+        print(f"  Completed (file added): {n_completed}  (was in DB, missing GPX/FIT added)")
+        print(f"  Outside dates        : {n_date_filtered}  (filtered out)")
+        print(f"  File missing         : {n_gpx_missing}")
+        print(f"  File name conflict   : {n_gpx_skipped}  (existing file preserved)")
+        print(f"  Errors               : {n_parse_error}")
 
 
 # ---------------------------------------------------------------------------
@@ -515,6 +642,10 @@ Examples:
     parser.add_argument(
         "--gpx-dest", metavar="DIR", default=None,
         help="Destination directory for GPX files. If omitted, GPX files are not copied.",
+    )
+    parser.add_argument(
+        "--fit-dest", metavar="DIR", default=None,
+        help="Destination directory for FIT/FIT.GZ files. If omitted, FIT files are not copied.",
     )
     parser.add_argument(
         "--start-date", metavar="DATE", type=parse_date, default=None,
@@ -566,11 +697,13 @@ Examples:
 
     db_path  = Path(args.db)
     gpx_dest = Path(args.gpx_dest) if args.gpx_dest else None
+    fit_dest = Path(args.fit_dest) if args.fit_dest else None
 
     print(f"Strava import")
     print(f"  dump         : {dump_dir}")
     print(f"  db           : {db_path}")
     print(f"  gpx-dest     : {gpx_dest or '(not copying)'}")
+    print(f"  fit-dest     : {fit_dest or '(not copying)'}")
     print(f"  dates        : {args.start_date or 'any'} → {args.end_date or 'any'}")
     print(f"  user_id      : {args.user_id}")
     print(f"  dry-run      : {args.dry_run}")
@@ -593,6 +726,7 @@ Examples:
         dump_dir=dump_dir,
         db_path=db_path,
         gpx_dest=gpx_dest,
+        fit_dest=fit_dest,
         start_date=args.start_date,
         end_date=args.end_date,
         user_id=args.user_id,
