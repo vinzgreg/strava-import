@@ -66,6 +66,23 @@ GPX_NS = "http://www.topografix.com/GPX/1/1"
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _normalize_ts(ts: str | None) -> str | None:
+    """Normalise a timestamp to 'YYYY-MM-DDTHH:MM:SS' for comparison.
+
+    Handles both ISO 8601 ('T') and SQLite space-separated formats, and
+    strips any trailing timezone suffix so we compare bare wall-clock time.
+    """
+    if not ts:
+        return None
+    s = ts.strip().replace(" ", "T")
+    # drop trailing Z or +00:00 / -HH:MM style offsets
+    for sep in ("Z", "+", "-"):
+        idx = s.find(sep, 10)  # skip the date part
+        if idx != -1:
+            s = s[:idx]
+    return s
+
+
 def _float(s: str) -> float | None:
     s = s.strip()
     if not s:
@@ -378,10 +395,10 @@ def import_activities(
         "SELECT 1 FROM pragma_table_info('activities') WHERE name='fit_path'"
     ).fetchone())
     _select = (
-        "SELECT garmin_activity_id, id, gpx_path, fit_path, start_time_local "
+        "SELECT garmin_activity_id, id, gpx_path, fit_path, start_time_local, start_time_utc "
         "FROM activities WHERE user_id = ?"
         if _has_fit_path else
-        "SELECT garmin_activity_id, id, gpx_path, NULL, start_time_local "
+        "SELECT garmin_activity_id, id, gpx_path, NULL, start_time_local, start_time_utc "
         "FROM activities WHERE user_id = ?"
     )
     existing_by_id: dict[str, dict] = {}
@@ -389,8 +406,12 @@ def import_activities(
     for r in conn.execute(_select, (user_id,)):
         entry = {"id": r[1], "gpx_path": r[2], "fit_path": r[3]}
         existing_by_id[r[0]] = entry
-        if r[4]:
-            existing_by_time[r[4]] = entry
+        # Index by both local and UTC timestamps (normalised) so we match
+        # regardless of which one Strava's date_local actually corresponds to.
+        for raw_ts in (r[4], r[5]):
+            norm = _normalize_ts(raw_ts)
+            if norm and norm not in existing_by_time:
+                existing_by_time[norm] = entry
     existing_ids: set[str] = set(existing_by_id.keys())
 
     if not dry_run and gpx_dest:
@@ -431,11 +452,15 @@ def import_activities(
                     n_date_filtered += 1
                     continue
 
-            # --- duplicate check (by ID, then by start time) ---
+            # --- duplicate check (by ID, then by normalised start time) ---
             existing = existing_by_id.get(d["garmin_activity_id"])
-            if existing is None and d["start_local"] and d["start_local"] in existing_by_time:
-                existing = existing_by_time[d["start_local"]]
-                existing_ids.add(d["garmin_activity_id"])
+            if existing is None:
+                for ts in (d["start_local"], d["start_utc"]):
+                    norm = _normalize_ts(ts)
+                    if norm and norm in existing_by_time:
+                        existing = existing_by_time[norm]
+                        existing_ids.add(d["garmin_activity_id"])
+                        break
 
             if d["garmin_activity_id"] in existing_ids:
                 if existing is not None:
