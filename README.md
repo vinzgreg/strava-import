@@ -134,8 +134,8 @@ it uses `CREATE TABLE IF NOT EXISTS` and auto-migrates missing columns
 | `activity_name` | Name der Aktivität |
 | `activity_type` / `sport_type` | Aktivitätsart |
 | `source` | Always `'Strava-Import'` |
-| `start_time_local` | Aktivitätsdatum (DD.MM.YYYY, HH:MM:SS → ISO 8601) |
-| `start_time_utc` | Startzeit (if present) |
+| `start_time_local` | Aktivitätsdatum (DD.MM.YYYY, HH:MM:SS → ISO 8601) — always populated |
+| `start_time_utc` | Startzeit — only present for newer activities; empty for older exports |
 | `elapsed_time_s` / `duration_s` | Verstrichene Zeit (seconds, 2nd column) |
 | `moving_time_s` | Bewegungszeit |
 | `distance_m` | Distanz (meters, 2nd column) |
