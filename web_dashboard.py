@@ -156,6 +156,58 @@ def api_data():
 
     with get_db() as db:
         rows = db.execute(sql, params).fetchall()
+        r = db.execute(
+            f"SELECT activity_name, start_time_local, avg_speed_ms "
+            f"FROM activities WHERE user_id=? AND activity_type IN ({type_ph}) "
+            f"AND distance_m>0 AND avg_speed_ms>0.3 {year_clause} "
+            f"ORDER BY avg_speed_ms DESC LIMIT 1",
+            params,
+        ).fetchone()
+        fastest = (
+            {"name": r["activity_name"] or "—",
+             "date": (r["start_time_local"] or "")[:10],
+             "speed_ms": safe_float(r["avg_speed_ms"])}
+            if r else None
+        )
+        r = db.execute(
+            f"SELECT activity_name, start_time_local, distance_m "
+            f"FROM activities WHERE user_id=? AND activity_type IN ({type_ph}) "
+            f"AND distance_m>0 {year_clause} "
+            f"ORDER BY distance_m DESC LIMIT 1",
+            params,
+        ).fetchone()
+        longest = (
+            {"name": r["activity_name"] or "—",
+             "date": (r["start_time_local"] or "")[:10],
+             "distance_km": round(float(r["distance_m"]) / 1000, 2)}
+            if r else None
+        )
+        def _row_to_dict(row):
+            return {
+                "name": row["activity_name"] or "—",
+                "date": (row["start_time_local"] or "")[:10],
+                "distance_km": round(float(row["distance_m"]) / 1000, 2),
+                "speed_ms": safe_float(row["avg_speed_ms"]),
+                "duration_s": int(row["duration_s"]) if row["duration_s"] else None,
+            }
+        top5_fastest = [
+            _row_to_dict(r) for r in db.execute(
+                f"SELECT activity_name, start_time_local, distance_m, avg_speed_ms, duration_s "
+                f"FROM activities WHERE user_id=? AND activity_type IN ({type_ph}) "
+                f"AND distance_m>0 AND avg_speed_ms>0.3 {year_clause} "
+                f"ORDER BY avg_speed_ms DESC LIMIT 5",
+                params,
+            ).fetchall()
+        ]
+        top5_longest = [
+            _row_to_dict(r) for r in db.execute(
+                f"SELECT activity_name, start_time_local, distance_m, avg_speed_ms, duration_s "
+                f"FROM activities WHERE user_id=? AND activity_type IN ({type_ph}) "
+                f"AND distance_m>0 {year_clause} "
+                f"ORDER BY distance_m DESC LIMIT 5",
+                params,
+            ).fetchall()
+        ]
 
     periods: list[str] = []
     distances: list[float] = []
@@ -192,6 +244,12 @@ def api_data():
             "elevation_m": int(sum(elevations)),
             "avg_speed_ms": overall_avg,
             "best_speed_ms": round(overall_best, 4) if overall_best else None,
+        },
+        "records": {
+            "fastest": fastest,
+            "longest": longest,
+            "top5_fastest": top5_fastest,
+            "top5_longest": top5_longest,
         },
     })
 

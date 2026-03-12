@@ -87,6 +87,11 @@
     <div class="col-12 col-sm-8 col-md-4">
       <label class="form-label">Activity Types</label>
       <select id="sel-types" multiple placeholder="Select types…"></select>
+      <div class="mt-1 d-flex gap-1 flex-wrap">
+        <button type="button" class="btn btn-xs py-0 px-2" style="font-size:.75rem;background:#FF6B3522;border:1px solid #FF6B35;color:#FF6B35;" onclick="quickFilter('running')">🏃 Running</button>
+        <button type="button" class="btn btn-xs py-0 px-2" style="font-size:.75rem;background:#00B4D822;border:1px solid #00B4D8;color:#00B4D8;" onclick="quickFilter('bike')">🚴 Bike</button>
+        <button type="button" class="btn btn-xs py-0 px-2" style="font-size:.75rem;background:#A855F722;border:1px solid #A855F7;color:#A855F7;" onclick="quickFilter('mtb')">🚵 MTB</button>
+      </div>
     </div>
     <div class="col-6 col-sm-4 col-md-2">
       <label class="form-label">Group by</label>
@@ -137,6 +142,54 @@
         <div class="label" id="card-best-label">Best Pace</div>
         <div class="value" id="card-best">—</div>
         <div class="sub" id="card-best-sub">min/km (fastest activity)</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Record cards -->
+  <div class="row g-2 mb-3" id="record-cards">
+    <div class="col-12 col-sm-6">
+      <div class="stat-card h-100">
+        <div class="label" id="rec-fast-label">Fastest Activity</div>
+        <div class="value" id="rec-fast-val">—</div>
+        <div class="sub" id="rec-fast-sub">—</div>
+      </div>
+    </div>
+    <div class="col-12 col-sm-6">
+      <div class="stat-card h-100">
+        <div class="label">Longest Activity</div>
+        <div class="value" id="rec-long-val">—</div>
+        <div class="sub" id="rec-long-sub">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Top 5 tables -->
+  <div class="row g-3 mb-3" id="top5-section">
+    <div class="col-12 col-lg-6">
+      <div class="chart-card h-100">
+        <div class="chart-title" id="top5-fast-title">Top 5 Fastest</div>
+        <div class="table-responsive">
+          <table class="table table-sm mb-0" style="font-size:.82rem;color:#c8d0e0;">
+            <thead><tr style="color:#64748b;">
+              <th>#</th><th>Activity</th><th>Date</th><th>Dist</th><th id="top5-fast-col">Pace / Speed</th>
+            </tr></thead>
+            <tbody id="top5-fast-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    <div class="col-12 col-lg-6">
+      <div class="chart-card h-100">
+        <div class="chart-title">Top 5 Longest</div>
+        <div class="table-responsive">
+          <table class="table table-sm mb-0" style="font-size:.82rem;color:#c8d0e0;">
+            <thead><tr style="color:#64748b;">
+              <th>#</th><th>Activity</th><th>Date</th><th>Dist</th><th id="top5-long-col">Pace / Speed</th>
+            </tr></thead>
+            <tbody id="top5-long-body"></tbody>
+          </table>
+        </div>
       </div>
     </div>
   </div>
@@ -455,6 +508,63 @@ function buildElevChart(data) {
   });
 }
 
+// ── Quick filter presets ──────────────────────────────────────────────────
+const MTB_KW = ['mtb', 'mountain'];
+
+function quickFilter(preset) {
+  if (!tsTypes) return;
+  const all = Object.keys(tsTypes.options);
+  let matched;
+  if (preset === 'running') {
+    matched = all.filter(t => RUN_KW.some(k => t.toLowerCase().includes(k)));
+  } else if (preset === 'bike') {
+    matched = all.filter(t =>
+      CYC_KW.some(k => t.toLowerCase().includes(k)) &&
+      !MTB_KW.some(k => t.toLowerCase().includes(k))
+    );
+    // fallback: include all cycling if no non-MTB cycling found
+    if (!matched.length) matched = all.filter(t => CYC_KW.some(k => t.toLowerCase().includes(k)));
+  } else if (preset === 'mtb') {
+    matched = all.filter(t => MTB_KW.some(k => t.toLowerCase().includes(k)));
+    // fallback: cycling keywords
+    if (!matched.length) matched = all.filter(t => CYC_KW.some(k => t.toLowerCase().includes(k)));
+  }
+  if (matched && matched.length) {
+    tsTypes.setValue(matched);
+    applyFilters();
+  }
+}
+
+// ── Record cards ──────────────────────────────────────────────────────────
+function updateRecords(data) {
+  const mode  = data.metric_mode;
+  const isCyc = mode === 'cycling';
+  const rec   = data.records || {};
+
+  const fastest = rec.fastest;
+  const longest = rec.longest;
+
+  $('rec-fast-label').textContent = isCyc ? 'Fastest Ride (avg speed)' : 'Fastest Activity (avg pace)';
+
+  if (fastest) {
+    $('rec-fast-val').textContent = isCyc
+      ? fmtSpeed(fastest.speed_ms) + ' km/h'
+      : fmtPace(fastest.speed_ms) + ' /km';
+    $('rec-fast-sub').textContent = `${fastest.name}  ·  ${fastest.date}`;
+  } else {
+    $('rec-fast-val').textContent = '—';
+    $('rec-fast-sub').textContent = '';
+  }
+
+  if (longest) {
+    $('rec-long-val').textContent = longest.distance_km.toLocaleString('de-DE', { maximumFractionDigits: 1 }) + ' km';
+    $('rec-long-sub').textContent = `${longest.name}  ·  ${longest.date}`;
+  } else {
+    $('rec-long-val').textContent = '—';
+    $('rec-long-sub').textContent = '';
+  }
+}
+
 // ── Stat cards ────────────────────────────────────────────────────────────
 function updateStatCards(data) {
   const { totals, metric_mode: mode } = data;
@@ -480,6 +590,49 @@ function updateStatCards(data) {
   }
 }
 
+// ── Top-5 tables ──────────────────────────────────────────────────────────
+function fmtDuration(s) {
+  if (!s) return '—';
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return h ? `${h}h ${String(m).padStart(2,'0')}m` : `${m}m`;
+}
+
+function updateTop5(data) {
+  const isCyc  = data.metric_mode === 'cycling';
+  const accent = ACCENT[data.metric_mode] || ACCENT.running;
+  const rec    = data.records || {};
+
+  const colLabel = isCyc ? 'Speed' : 'Pace';
+  $('top5-fast-title').textContent = isCyc ? 'Top 5 Fastest (avg speed)' : 'Top 5 Fastest (avg pace)';
+  $('top5-fast-col').textContent   = colLabel;
+  $('top5-long-col').textContent   = colLabel;
+
+  function fillTable(tbodyId, rows) {
+    const tbody = $(tbodyId);
+    tbody.innerHTML = '';
+    (rows || []).forEach((r, i) => {
+      const pace = isCyc
+        ? (r.speed_ms ? fmtSpeed(r.speed_ms) + ' km/h' : '—')
+        : (r.speed_ms ? fmtPace(r.speed_ms) + ' /km'  : '—');
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td style="color:${accent};font-weight:700;">${i + 1}</td>
+        <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${r.name}">${r.name}</td>
+        <td style="white-space:nowrap;">${r.date}</td>
+        <td style="white-space:nowrap;">${r.distance_km.toLocaleString('de-DE',{maximumFractionDigits:1})} km</td>
+        <td style="white-space:nowrap;">${pace}</td>`;
+      tbody.appendChild(tr);
+    });
+    if (!(rows || []).length) {
+      tbody.innerHTML = '<tr><td colspan="5" style="color:#64748b;text-align:center;">No data</td></tr>';
+    }
+  }
+
+  fillTable('top5-fast-body', rec.top5_fastest);
+  fillTable('top5-long-body', rec.top5_longest);
+}
+
 // ── Main render ───────────────────────────────────────────────────────────
 function renderData(data) {
   currentData = data;
@@ -492,6 +645,8 @@ function renderData(data) {
   $('elev-card').style.display = showElev ? '' : 'none';
 
   updateStatCards(data);
+  updateRecords(data);
+  updateTop5(data);
   buildDistanceChart(data);
   buildPaceChart(data);
   if (showElev) buildElevChart(data);
@@ -600,6 +755,21 @@ async function loadUsers() {
   if (vinz) sel.value = 1;
 }
 
+// ── Aggregation helper ────────────────────────────────────────────────────
+// Rolls up periods+distances to yearly buckets when they exceed maxBars.
+// Returns { labels, data, aggregated } where aggregated=true means yearly rollup was applied.
+function aggregateToFit(periods, distances, maxBars = 24) {
+  if (periods.length <= maxBars) return { labels: periods, data: distances, aggregated: false };
+  const map = {};
+  periods.forEach((p, i) => {
+    const y = p.slice(0, 4);
+    map[y] = (map[y] || 0) + (distances[i] || 0);
+  });
+  const labels = Object.keys(map).sort();
+  const data   = labels.map(y => +map[y].toFixed(2));
+  return { labels, data, aggregated: true };
+}
+
 // ── Export helpers ────────────────────────────────────────────────────────
 function buildExportText() {
   if (!currentData) return '(no data loaded yet)';
@@ -622,8 +792,13 @@ function buildExportText() {
   const typeDisp = isCyc ? 'Cycling' : 'Running';
   const tags     = isCyc ? '#cycling #sportsstats' : '#running #sportsstats';
 
-  // Top 5 periods by distance
-  const combined = d.periods.map((p, i) => ({ p, km: d.distance_km[i], n: d.activity_count[i] }));
+  // Top 5 periods by distance — aggregate to years first if many periods
+  const agg = aggregateToFit(d.periods, d.distance_km);
+  const combined = agg.labels.map((p, i) => ({ p, km: agg.data[i], n: null }));
+  if (!agg.aggregated) {
+    // attach activity counts when not aggregated (we have them 1:1)
+    combined.forEach((c, i) => { c.n = d.activity_count[i]; });
+  }
   combined.sort((a, b) => b.km - a.km);
   const top5 = combined.slice(0, 5);
 
@@ -647,7 +822,8 @@ function buildExportText() {
   lines.push('');
   lines.push('Top periods by distance:');
   top5.forEach(r => {
-    lines.push(`  • ${r.p}: ${r.km.toFixed(1)} km (${r.n})`);
+    const count = r.n != null ? ` (${r.n})` : '';
+    lines.push(`  • ${r.p}: ${r.km.toFixed(1)} km${count}`);
   });
   lines.push('');
   lines.push(tags);
@@ -751,26 +927,30 @@ function drawSocialCard() {
 
   divider(640);
 
+  // Sparkline — aggregate to yearly if needed so the full history fits
+  const sparkAgg  = aggregateToFit(d.periods, d.distance_km);
+  const sparkLabels = sparkAgg.labels;
+  const sparkData   = sparkAgg.data;
+  const sparkRes    = sparkAgg.aggregated ? 'Yearly' : glabel;
+
   // Sparkline title
   ctx.fillStyle  = '#94a3b8';
   ctx.font       = '22px system-ui, sans-serif';
   ctx.textAlign  = 'left';
-  ctx.fillText(`${glabel} distance (km) — last periods`, 60, 680);
+  ctx.fillText(`${sparkRes} distance (km) — full history`, 60, 680);
 
   // Sparkline bars
   const SPARK_X = 60, SPARK_Y = 700, SPARK_W = W - 120, SPARK_H = 240;
-  const dist = d.distance_km;
-  const n    = Math.min(dist.length, 24);
-  const slice = dist.slice(-n);
-  const maxD  = Math.max(...slice.filter(v => v > 0), 1);
-  const barW  = Math.floor((SPARK_W / n) * 0.72);
-  const step  = SPARK_W / n;
+  const n    = sparkLabels.length;
+  const maxD = Math.max(...sparkData.filter(v => v > 0), 1);
+  const barW = Math.floor((SPARK_W / n) * 0.72);
+  const step = SPARK_W / n;
 
-  slice.forEach((val, i) => {
+  sparkData.forEach((val, i) => {
     const bh  = Math.max(4, (val / maxD) * SPARK_H);
     const bx  = SPARK_X + i * step + (step - barW) / 2;
     const by  = SPARK_Y + SPARK_H - bh;
-    const isLast = i === slice.length - 1;
+    const isLast = i === sparkData.length - 1;
     ctx.fillStyle = isLast ? accent : accent + '88';
     ctx.beginPath();
     ctx.roundRect(bx, by, barW, bh, 3);
@@ -782,7 +962,7 @@ function drawSocialCard() {
   ctx.fillStyle = '#64748b';
   ctx.font      = '18px system-ui, sans-serif';
   ctx.textAlign = 'center';
-  d.periods.slice(-n).forEach((p, i) => {
+  sparkLabels.forEach((p, i) => {
     if (i % step_lbl === 0) {
       const bx = SPARK_X + i * step + step / 2;
       ctx.fillText(p, bx, SPARK_Y + SPARK_H + 24);
