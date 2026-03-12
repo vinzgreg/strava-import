@@ -804,6 +804,7 @@ $('btn-apply').addEventListener('click', applyFilters);
 $('sel-user').addEventListener('change', async () => {
   const uid = $('sel-user').value;
   await Promise.all([loadActivityTypes(uid), loadYears(uid)]);
+  await applyFilters();
 });
 
 $('btn-copy-text').addEventListener('click', () => {
