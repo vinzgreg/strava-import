@@ -23,6 +23,7 @@ specified per run.
 | `--runmeter FILE` | **Runmeter** CSV | Semicolon-separated summary CSV (one row per activity) |
 | `--cyclemeter FILE` | **Cyclemeter** CSV | Semicolon-separated CSV (one row per activity, full timestamp) |
 | `--dailymile DIR` | **DailyMile** export | Folder containing `dailymile_export.csv` + per-activity JSON files |
+| `--applehealth DIR` | **Apple Health** export | Extracted `Export.zip` folder containing `Export.xml` |
 
 ### Requirements
 
@@ -216,6 +217,99 @@ python3 strava_import.py --cyclemeter FILE --db FILE [OPTIONS]
 python3 strava_import.py \
     --cyclemeter runmeter_data/Cyclemeter_Import.csv \
     --db ~/data/garmin_nostra.db \
+    --backup
+```
+
+---
+
+### Mode: Apple Health (`--applehealth`)
+
+Imports workouts from an **Apple Health** export. On your iPhone: Health app →
+profile picture → **Export All Health Data** → share the resulting `Export.zip`
+and extract it. Pass the extracted folder (the one containing `Export.xml`) to
+this mode.
+
+The XML is parsed with `iterparse` so even very large exports (> 1 GB) are
+handled efficiently.
+
+#### Usage
+
+```bash
+python3 strava_import.py --applehealth DIR --db FILE [OPTIONS]
+```
+
+#### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `--applehealth DIR` | *(required)* | Path to the extracted Apple Health export folder. |
+| `--db FILE` | *(required)* | SQLite database file. |
+| `--gpx-dest DIR` | *(not set)* | Directory to copy workout-route GPX files into. |
+| `--user-id N` | `1` | `user_id` assigned to every imported row. |
+| `--start-date DATE` | *(none)* | Only import activities on or after this date. |
+| `--end-date DATE` | *(none)* | Only import activities on or before this date. |
+| `--init-db` | *(off)* | Create tables if missing. |
+| `--dry-run` | *(off)* | Simulate without touching the DB. |
+| `--backup` | *(off)* | Write a timestamped DB backup before any changes. |
+| `--overwrite-gpx` | *(off)* | Overwrite GPX files that already exist in `--gpx-dest`. |
+
+#### Field mapping
+
+| DB column | Source |
+|---|---|
+| `garmin_activity_id` | `"applehealth_<UTC_timestamp>"` (synthetic, stable) |
+| `activity_name` | `"<type> <date>"` e.g. `"Lauf 2024-06-15"` |
+| `activity_type` / `sport_type` | Mapped from `HKWorkoutActivityType*` (70+ types) |
+| `source` | Always `'AppleHealth-Import'` |
+| `start_time_utc` | `startDate` attribute converted to UTC |
+| `start_time_local` | `startDate` wall-clock time (timezone stripped) |
+| `duration_s` | `duration` attribute (converted from minutes) |
+| `distance_m` | `WorkoutStatistics` sum for distance types (km × 1000) |
+| `avg_speed_ms` | Derived: `distance_m / duration_s` |
+| `avg_hr` / `max_hr` | `WorkoutStatistics HKQuantityTypeIdentifierHeartRate` |
+| `elevation_gain_m` | `WorkoutStatistics HKQuantityTypeIdentifierElevationAscended` |
+| `calories` | `totalEnergyBurned` attr or `HKQuantityTypeIdentifierActiveEnergyBurned` |
+| `gpx_path` | Absolute path of copied GPX from `workout-routes/` |
+| `raw_json` | `{"applehealth_source": "Apple Watch"}` |
+
+#### Activity type mapping (selected)
+
+| `HKWorkoutActivityType` | DB `activity_type` |
+|---|---|
+| Running | Lauf |
+| Cycling / IndoorCycling / HandCycling | Fahrrad |
+| Walking / IndoorWalk | Walk |
+| Hiking | Wandern |
+| Swimming / OpenWaterSwimming | Schwimmen |
+| FunctionalStrengthTraining / TraditionalStrengthTraining | Kraft |
+| HighIntensityIntervalTraining | HIIT |
+| CrossCountrySkiing | Langlauf |
+| Skiing / DownhillSkiing | Ski |
+| SwimBikeRun | Triathlon |
+| … 60+ more | mapped or passed through as-is |
+
+#### Notes
+
+- Activities with distance ≤ 9 m are skipped; workouts without any distance
+  (e.g. strength training) are imported with `distance_m = NULL`.
+- Cross-source duplicate detection uses a ±2 h time window plus ±5 % distance
+  against existing activities for the same `--user-id`.
+- Both `export.xml` and `Export.xml` filenames are accepted.
+
+#### Examples
+
+```bash
+# Dry-run preview
+python3 strava_import.py \
+    --applehealth apple_health_export \
+    --db ~/data/garmin_nostra.db \
+    --dry-run
+
+# Full import with GPX files
+python3 strava_import.py \
+    --applehealth apple_health_export \
+    --db ~/data/garmin_nostra.db \
+    --gpx-dest data/gpx \
     --backup
 ```
 
