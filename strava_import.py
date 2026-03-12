@@ -13,9 +13,15 @@ import json
 import shutil
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import xml.etree.ElementTree as ET
+
+try:
+    from zoneinfo import ZoneInfo as _ZoneInfo
+    _BERLIN_TZ = _ZoneInfo("Europe/Berlin")
+except Exception:
+    _BERLIN_TZ = None
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +136,14 @@ CYCLEMETER_COL = {
     "bike":          36,  # Fahrrad (bike name) → raw_json
     # col 37: Schuhe — skip
     "notes":         38,  # Notizen → raw_json
+}
+
+# DailyMile JSON activity_type.name → DB activity_type
+_DAILYMILE_TYPE_MAP = {
+    "Running": "Lauf",
+    "Cycling": "Fahrrad",
+    "Walking": "Walk",
+    "Fitness": "Fitness",
 }
 
 
@@ -350,10 +364,20 @@ def _find_cross_source_duplicate(
 
         # --- Time / date check ---
         if date_only:
+            # Source is date-only (Runmeter): compare calendar dates
             ex_local = ex.get("start_time_local") or ""
             if ex_local[:10] != date_str:
                 continue
+        elif ex.get("date_only"):
+            # DB entry is date-only (Runmeter stored as midnight): compare
+            # source local date against DB date — covers DailyMile UTC→local
+            ex_dt_local = ex.get("dt_local")
+            if not src_dt or not ex_dt_local:
+                continue
+            if src_dt.date() != ex_dt_local.date():
+                continue
         else:
+            # Both have full timestamps: compare within ±window_h
             ex_dts = [
                 dt for dt in (
                     _parse_ts(ex.get("start_time_local")),
@@ -1220,9 +1244,12 @@ def import_runmeter_activities(
         (user_id,),
     ):
         existing_ids.add(r[0])
+        _dt_local = _parse_ts(r[2])
         existing_list.append({
             "id": r[1], "start_time_local": r[2], "start_time_utc": r[3],
             "distance_m": r[4], "activity_name": r[5],
+            "dt_local": _dt_local,
+            "date_only": bool(_dt_local and _dt_local.hour == 0 and _dt_local.minute == 0 and _dt_local.second == 0),
         })
 
     n_new = n_skipped = n_cross_dup = n_date_filtered = n_parse_error = 0
@@ -1394,9 +1421,12 @@ def import_cyclemeter_activities(
         (user_id,),
     ):
         existing_ids.add(r[0])
+        _dt_local = _parse_ts(r[2])
         existing_list.append({
             "id": r[1], "start_time_local": r[2], "start_time_utc": r[3],
             "distance_m": r[4], "activity_name": r[5],
+            "dt_local": _dt_local,
+            "date_only": bool(_dt_local and _dt_local.hour == 0 and _dt_local.minute == 0 and _dt_local.second == 0),
         })
 
     n_new = n_skipped = n_cross_dup = n_date_filtered = n_skipped_invalid = n_parse_error = 0
@@ -1527,6 +1557,265 @@ def import_cyclemeter_activities(
 
 
 # ---------------------------------------------------------------------------
+# DailyMile import
+# ---------------------------------------------------------------------------
+
+def _parse_dailymile_row(row: list[str], base_dir: Path) -> dict | None:
+    """Parse a DailyMile CSV row and its companion JSON file.
+
+    Returns None for rows that must be skipped (zero/noise distance,
+    unparseable date).
+    """
+    if len(row) < 5:
+        return None
+    rel_path = row[0].strip()
+    title    = row[1].strip()
+    date_str = row[2].strip()   # "YYYY-MM-DD HH:MM:SS UTC"
+    text     = row[3].strip() if len(row) > 3 else ""
+    dist_str = row[4].strip() if len(row) > 4 else ""
+    dur_str  = row[5].strip() if len(row) > 5 else ""
+
+    # Parse UTC start time
+    try:
+        start_utc_dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S UTC")
+    except ValueError:
+        return None
+
+    # Distance — skip zero / GPS noise (≤ 9 m)
+    dist_m = _float(dist_str) or 0.0
+    if dist_m <= 9:
+        return None
+
+    # Duration — discard clearly bogus values > 24 h
+    duration_s = _float(dur_str)
+    if duration_s and duration_s > 86400:
+        duration_s = None
+
+    # UTC → Europe/Berlin local time
+    if _BERLIN_TZ is not None:
+        local_dt = (
+            start_utc_dt.replace(tzinfo=timezone.utc)
+            .astimezone(_BERLIN_TZ)
+            .replace(tzinfo=None)
+        )
+    else:
+        # Rough fallback: +2 in summer (Apr–Oct), +1 in winter
+        offset_h = 2 if 3 < start_utc_dt.month < 10 else 1
+        local_dt = start_utc_dt + timedelta(hours=offset_h)
+
+    start_utc_str   = start_utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    start_local_str = local_dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+    # Load companion JSON for activity type and calories
+    activity_type = "Lauf"
+    calories = None
+    json_path = base_dir / rel_path
+    if json_path.exists():
+        try:
+            with open(json_path, encoding="utf-8") as jf:
+                j = json.load(jf)
+            raw_type = j.get("activity_type", {}).get("name", "Running")
+            activity_type = _DAILYMILE_TYPE_MAP.get(raw_type, raw_type)
+            calories = _int(str(j.get("calories") or "")) or None
+        except Exception:
+            pass
+
+    # Synthetic ID from filename  e.g. "activities/activity_9242514.json" → "dailymile_9242514"
+    stem = Path(rel_path).stem          # "activity_9242514"
+    activity_num = stem.replace("activity_", "")
+    garmin_activity_id = f"dailymile_{activity_num}"
+
+    activity_name = title if title else f"{activity_type} {start_local_str[:10]}"
+
+    return {
+        "garmin_activity_id": garmin_activity_id,
+        "activity_name":      activity_name,
+        "activity_type":      activity_type,
+        "start_utc":          start_utc_str,
+        "start_local":        start_local_str,
+        "duration_s":         duration_s,
+        "dist_m":             dist_m,
+        "calories":           calories,
+        "text":               text if text else None,
+    }
+
+
+def import_dailymile_activities(
+    dump_dir: Path,
+    db_path: Path,
+    start_date: datetime | None,
+    end_date: datetime | None,
+    user_id: int,
+    dry_run: bool,
+    init_db: bool,
+) -> None:
+    activities_csv = dump_dir / "activities.csv"
+    if not activities_csv.exists():
+        sys.exit(f"ERROR: {activities_csv} not found.")
+
+    # --- DB connection ---
+    if dry_run:
+        if db_path.exists():
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            check_prerequisites(conn, user_id)
+        else:
+            if not init_db:
+                sys.exit(
+                    f"ERROR: database file not found: {db_path}\n"
+                    f"       Run with --init-db to create it on first use."
+                )
+            conn = sqlite3.connect(":memory:")
+            init_schema(conn)
+            conn.execute("INSERT OR IGNORE INTO users (id, name) VALUES (?, 'default')", (user_id,))
+            conn.commit()
+    else:
+        if not db_path.exists() and not init_db:
+            sys.exit(
+                f"ERROR: database file not found: {db_path}\n"
+                f"       Run with --init-db to create it on first use."
+            )
+        conn = sqlite3.connect(db_path)
+        if init_db:
+            init_schema(conn)
+            conn.execute("INSERT OR IGNORE INTO users (id, name) VALUES (?, 'default')", (user_id,))
+            conn.commit()
+        check_prerequisites(conn, user_id)
+        migrate_schema(conn)
+
+    existing_ids: set[str] = set()
+    existing_list: list[dict] = []
+    cross_claimed_ids: set[int] = set()
+    for r in conn.execute(
+        "SELECT garmin_activity_id, id, start_time_local, start_time_utc, distance_m, activity_name "
+        "FROM activities WHERE user_id = ?",
+        (user_id,),
+    ):
+        existing_ids.add(r[0])
+        _dt_local = _parse_ts(r[2])
+        existing_list.append({
+            "id": r[1], "start_time_local": r[2], "start_time_utc": r[3],
+            "distance_m": r[4], "activity_name": r[5],
+            "dt_local": _dt_local,
+            "date_only": bool(_dt_local and _dt_local.hour == 0 and _dt_local.minute == 0 and _dt_local.second == 0),
+        })
+
+    n_new = n_skipped = n_cross_dup = n_date_filtered = n_skipped_invalid = n_parse_error = 0
+    synced_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    with open(activities_csv, newline="", encoding="utf-8") as fh:
+        reader = csv.reader(fh)
+        next(reader)  # skip header
+
+        for lineno, row in enumerate(reader, start=2):
+            if not row or not row[0].strip():
+                continue
+
+            try:
+                d = _parse_dailymile_row(row, dump_dir)
+            except Exception as exc:
+                print(f"  ERROR line {lineno}: parse error — {exc}", file=sys.stderr)
+                n_parse_error += 1
+                continue
+
+            if d is None:
+                n_skipped_invalid += 1
+                continue
+
+            # --- date filter ---
+            try:
+                dt = datetime.fromisoformat(d["start_local"])
+            except ValueError:
+                print(f"  ERROR line {lineno}: bad date {d['start_local']!r}", file=sys.stderr)
+                n_parse_error += 1
+                continue
+            if start_date and dt < start_date:
+                n_date_filtered += 1
+                continue
+            if end_date and dt > end_date:
+                n_date_filtered += 1
+                continue
+
+            # --- exact duplicate check ---
+            if d["garmin_activity_id"] in existing_ids:
+                n_skipped += 1
+                continue
+
+            # --- cross-source duplicate check (±2 h local time + distance) ---
+            cross_dup = _find_cross_source_duplicate(
+                existing_list, cross_claimed_ids,
+                d["start_local"], d["dist_m"],
+                date_only=False,
+                window_h=2.0,
+            )
+            if cross_dup is not None:
+                cross_claimed_ids.add(cross_dup["id"])
+                n_cross_dup += 1
+                print(
+                    f"  CROSS-DUP    {d['activity_name']!r:45s} {d['start_local']}"
+                    f"  ≈ {cross_dup.get('activity_name')!r}"
+                    f"  dist {d['dist_m']:.0f}m ≈ {cross_dup['distance_m']:.0f}m"
+                )
+                continue
+
+            if dry_run:
+                n_new += 1
+                continue
+
+            # --- insert ---
+            raw_json = json.dumps(
+                {k: v for k, v in {"dailymile_text": d["text"]}.items() if v},
+                ensure_ascii=False,
+            )
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO activities (
+                        user_id, garmin_activity_id,
+                        activity_name, activity_type, sport_type,
+                        start_time_utc, start_time_local,
+                        duration_s, elapsed_time_s, moving_time_s,
+                        distance_m,
+                        calories,
+                        raw_json, source, synced_at
+                    ) VALUES (
+                        ?,?,  ?,?,?,  ?,?,  ?,?,?,  ?,  ?,  ?,?,?
+                    )
+                    """,
+                    (
+                        user_id, d["garmin_activity_id"],
+                        d["activity_name"], d["activity_type"], d["activity_type"],
+                        d["start_utc"], d["start_local"],
+                        d["duration_s"], d["duration_s"], d["duration_s"],
+                        d["dist_m"],
+                        d["calories"],
+                        raw_json, "DailyMile-Import", synced_at,
+                    ),
+                )
+                conn.commit()
+                existing_ids.add(d["garmin_activity_id"])
+                n_new += 1
+            except Exception as exc:
+                print(
+                    f"  ERROR line {lineno} {d['garmin_activity_id']}: {exc}",
+                    file=sys.stderr,
+                )
+                n_parse_error += 1
+
+    conn.close()
+
+    # --- summary ---
+    if dry_run:
+        print("DRY-RUN — nothing was written.\n")
+    print(f"\nDone.")
+    print(f"  Imported              : {n_new}")
+    print(f"  Skipped (duplicate)   : {n_skipped}  (already in DB, same source)")
+    print(f"  Skipped (cross-source): {n_cross_dup}  (same time ±2h + distance already in DB)")
+    print(f"  Skipped (invalid)     : {n_skipped_invalid}  (zero/noise distance or bad date)")
+    print(f"  Outside dates         : {n_date_filtered}  (filtered out)")
+    print(f"  Errors                : {n_parse_error}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1554,10 +1843,14 @@ Examples:
   # Import Cyclemeter CSV
   python strava_import.py --cyclemeter runmeter_data/Cyclemeter_Import.csv --db garmin.db
 
+  # Import DailyMile export folder
+  python strava_import.py --dailymile dailymile_export/dailymile_export_NTQtMjkwODM5 --db garmin.db
+
   # Dry-run any import
   python strava_import.py --dump "Strava Dump 20260310" --db garmin.db --dry-run
   python strava_import.py --runmeter runmeter_data/Runmeter_Import.csv --db garmin.db --dry-run
   python strava_import.py --cyclemeter runmeter_data/Cyclemeter_Import.csv --db garmin.db --dry-run
+  python strava_import.py --dailymile dailymile_export/dailymile_export_NTQtMjkwODM5 --db garmin.db --dry-run
 """,
     )
     source_group = parser.add_mutually_exclusive_group(required=True)
@@ -1572,6 +1865,10 @@ Examples:
     source_group.add_argument(
         "--cyclemeter", metavar="FILE",
         help="Path to a Cyclemeter CSV export file.",
+    )
+    source_group.add_argument(
+        "--dailymile", metavar="DIR",
+        help="Path to a DailyMile export folder (contains activities.csv and activities/).",
     )
     parser.add_argument(
         "--db", required=True, metavar="FILE",
@@ -1641,7 +1938,28 @@ Examples:
         else:
             print("--backup: DB does not exist yet, skipping backup.\n")
 
-    if args.runmeter or args.cyclemeter:
+    if args.dailymile:
+        dump_dir = Path(args.dailymile)
+        if not dump_dir.is_dir():
+            sys.exit(f"ERROR: DailyMile directory not found: {dump_dir}")
+        print(f"DailyMile import")
+        print(f"  dir          : {dump_dir}")
+        print(f"  db           : {db_path}")
+        print(f"  dates        : {args.start_date or 'any'} → {args.end_date or 'any'}")
+        print(f"  user_id      : {args.user_id}")
+        print(f"  dry-run      : {args.dry_run}")
+        print(f"  init-db      : {args.init_db}")
+        print()
+        import_dailymile_activities(
+            dump_dir=dump_dir,
+            db_path=db_path,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            user_id=args.user_id,
+            dry_run=args.dry_run,
+            init_db=args.init_db,
+        )
+    elif args.runmeter or args.cyclemeter:
         is_cyclemeter = bool(args.cyclemeter)
         csv_path = Path(args.cyclemeter if is_cyclemeter else args.runmeter)
         label = "Cyclemeter" if is_cyclemeter else "Runmeter"
