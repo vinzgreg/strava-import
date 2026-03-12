@@ -4,7 +4,7 @@ services:
     container_name: sports-dashboard
     restart: unless-stopped
     ports:
-      - "127.0.0.1:5050:5000"   # only reachable locally; nginx proxies from outside
+      - "5050:5000"   # reachable on all interfaces; restrict with ufw (see below)
     volumes:
       - /home/vinz/data/garminnostra/garmin_nostra.db:/data/garmin_nostra.db:ro
     environment:
