@@ -1,0 +1,12 @@
+services:
+  sports-dashboard:
+    build: .
+    container_name: sports-dashboard
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5050:5000"   # only reachable locally; nginx proxies from outside
+    volumes:
+      - /home/vinz/data/garminnostra/garmin_nostra.db:/data/garmin_nostra.db:ro
+    environment:
+      - DB_PATH=/data/garmin_nostra.db
+      - TZ=Europe/Berlin

@@ -2,6 +2,7 @@
 """Sports Activity Dashboard — Flask web app for garmin_nostra.db visualization."""
 
 import math
+import os
 import sqlite3
 from pathlib import Path
 
@@ -10,7 +11,7 @@ from flask import Flask, abort, jsonify, render_template, request
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-DB_PATH = Path.home() / "data" / "garminnostra" / "garmin_nostra.db"
+DB_PATH = Path(os.environ.get("DB_PATH", Path.home() / "data" / "garminnostra" / "garmin_nostra.db"))
 
 # Keywords used to classify activity types into cycling vs. running
 CYCLING_KEYWORDS = ["rad", "bike", "cycl", "ride", "velo", "gravel"]
