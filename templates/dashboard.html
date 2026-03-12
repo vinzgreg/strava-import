@@ -537,14 +537,14 @@ async function loadActivityTypes(userId) {
   if (tsTypes) { tsTypes.destroy(); tsTypes = null; }
 
   const res   = await fetch(`/api/activity_types?user_id=${userId}`);
-  const types = await res.json();
+  const items = await res.json();  // [{type, count}, ...]
 
   const select = $('sel-types');
   select.innerHTML = '';
-  types.forEach(t => {
+  items.forEach(({ type, count }) => {
     const opt  = document.createElement('option');
-    opt.value  = t;
-    opt.text   = t;
+    opt.value  = type;
+    opt.text   = `${type} (${count})`;
     select.appendChild(opt);
   });
 
@@ -554,8 +554,8 @@ async function loadActivityTypes(userId) {
     placeholder: 'Select types…',
   });
 
-  // Default: pre-select run/lauf types
-  const defaults = types.filter(isDefaultRunType);
+  // Default: pre-select run/lauf types (match by value, not label)
+  const defaults = items.filter(({ type }) => isDefaultRunType(type)).map(({ type }) => type);
   if (defaults.length) tsTypes.setValue(defaults);
 }
 

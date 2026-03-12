@@ -86,12 +86,12 @@ def api_activity_types():
         abort(400, "user_id required")
     with get_db() as db:
         rows = db.execute(
-            "SELECT DISTINCT activity_type FROM activities "
+            "SELECT activity_type, COUNT(*) AS cnt FROM activities "
             "WHERE user_id = ? AND activity_type IS NOT NULL "
-            "ORDER BY activity_type",
+            "GROUP BY activity_type ORDER BY activity_type",
             (user_id,),
         ).fetchall()
-    return jsonify([r["activity_type"] for r in rows])
+    return jsonify([{"type": r["activity_type"], "count": r["cnt"]} for r in rows])
 
 
 @app.route("/api/years")
