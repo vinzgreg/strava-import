@@ -146,6 +146,83 @@ _DAILYMILE_TYPE_MAP = {
     "Fitness": "Fitness",
 }
 
+# Apple Health HKWorkoutActivityType → DB activity_type
+# Strip leading "HKWorkoutActivityType" before lookup.
+_APPLEHEALTH_TYPE_MAP: dict[str, str] = {
+    "Running":                      "Lauf",
+    "Cycling":                      "Fahrrad",
+    "Walking":                      "Walk",
+    "Hiking":                       "Wandern",
+    "Swimming":                     "Schwimmen",
+    "OpenWaterSwimming":            "Schwimmen",
+    "FunctionalStrengthTraining":   "Kraft",
+    "TraditionalStrengthTraining":  "Kraft",
+    "Yoga":                         "Yoga",
+    "CrossTraining":                "Sport",
+    "Elliptical":                   "Elliptical",
+    "Rowing":                       "Rudern",
+    "StairClimbing":                "Treppe",
+    "HighIntensityIntervalTraining":"HIIT",
+    "MindAndBody":                  "Yoga",
+    "Pilates":                      "Pilates",
+    "Dance":                        "Tanzen",
+    "SocialDance":                  "Tanzen",
+    "Barre":                        "Barre",
+    "Soccer":                       "Fußball",
+    "Basketball":                   "Basketball",
+    "Tennis":                       "Tennis",
+    "Badminton":                    "Badminton",
+    "Golf":                         "Golf",
+    "Skiing":                       "Ski",
+    "Snowboarding":                 "Snowboard",
+    "Surfing":                      "Surfen",
+    "StepTraining":                 "Step",
+    "WaterFitness":                 "Wassersport",
+    "WaterSports":                  "Wassersport",
+    "WaterPolo":                    "Wasserball",
+    "Other":                        "Sport",
+    "MixedCardio":                  "Sport",
+    "PrepareAndRecover":            "Erholung",
+    "HandCycling":                  "Fahrrad",
+    "DownhillSkiing":               "Ski",
+    "CrossCountrySkiing":           "Langlauf",
+    "Skateboarding":                "Skateboard",
+    "RollerSports":                 "Rollsport",
+    "Climbing":                     "Klettern",
+    "Boxing":                       "Boxen",
+    "MartialArts":                  "Kampfsport",
+    "Wrestling":                    "Ringen",
+    "Archery":                      "Bogenschießen",
+    "AmericanFootball":             "Football",
+    "AustralianFootball":           "Football",
+    "Baseball":                     "Baseball",
+    "Softball":                     "Softball",
+    "Cricket":                      "Cricket",
+    "Rugby":                        "Rugby",
+    "Hockey":                       "Hockey",
+    "LacRosse":                     "Sport",
+    "Volleyball":                   "Volleyball",
+    "IndoorCycling":                "Fahrrad",
+    "IndoorRunning":                "Lauf",
+    "IndoorWalk":                   "Walk",
+    "TaiChi":                       "Kampfsport",
+    "Fencing":                      "Fechten",
+    "Gymnastics":                   "Turnen",
+    "Equestrian":                   "Reiten",
+    "Fishing":                      "Angeln",
+    "Hunting":                      "Sport",
+    "Play":                         "Sport",
+    "Curling":                      "Curling",
+    "DiscSports":                   "Sport",
+    "Squash":                       "Squash",
+    "TableTennis":                  "Tischtennis",
+    "Racquetball":                  "Squash",
+    "Pickleball":                   "Sport",
+    "JumpRope":                     "Sport",
+    "SwimBikeRun":                  "Triathlon",
+    "Transition":                   "Sport",
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1557,6 +1634,397 @@ def import_cyclemeter_activities(
 
 
 # ---------------------------------------------------------------------------
+# Apple Health import
+# ---------------------------------------------------------------------------
+
+def _ah_parse_date(s: str) -> datetime:
+    """Parse an Apple Health date string like '2023-06-15 08:30:00 +0200'."""
+    return datetime.strptime(s, "%Y-%m-%d %H:%M:%S %z")
+
+
+def _ah_dist_to_m(value: str | None, unit: str | None) -> float | None:
+    """Convert Apple Health distance to metres."""
+    if value is None:
+        return None
+    v = _float(value)
+    if v is None:
+        return None
+    u = (unit or "").lower().strip()
+    if u in ("km",):
+        return v * 1000.0
+    if u in ("mi", "mile", "miles"):
+        return v * 1609.344
+    if u in ("m", "meter", "meters"):
+        return v
+    # Unknown unit — assume km (most common for workouts)
+    return v * 1000.0
+
+
+def _ah_elev_to_m(value: str | None, unit: str | None) -> float | None:
+    """Convert Apple Health elevation to metres."""
+    if value is None:
+        return None
+    v = _float(value)
+    if v is None:
+        return None
+    u = (unit or "").lower().strip()
+    if u in ("ft", "feet"):
+        return v * 0.3048
+    return v  # assume metres
+
+
+def _parse_applehealth_workout(elem) -> dict | None:
+    """Parse a <Workout> XML element from Apple Health export.xml.
+
+    Returns None for workouts that must be skipped (zero/noise distance,
+    unparseable date).
+    """
+    raw_type = elem.get("workoutActivityType", "")
+    # Strip leading "HKWorkoutActivityType"
+    short_type = raw_type.replace("HKWorkoutActivityType", "")
+    activity_type = _APPLEHEALTH_TYPE_MAP.get(short_type, short_type or "Sport")
+
+    start_str = elem.get("startDate", "").strip()
+    end_str   = elem.get("endDate",   "").strip()
+    if not start_str:
+        return None
+
+    try:
+        start_dt = _ah_parse_date(start_str)
+    except ValueError:
+        return None
+
+    # Duration: prefer explicit attribute, fall back to endDate - startDate
+    duration_s: float | None = None
+    dur_val  = elem.get("duration")
+    dur_unit = elem.get("durationUnit", "min")
+    if dur_val:
+        d = _float(dur_val)
+        if d is not None:
+            dur_unit_lower = dur_unit.lower()
+            if "min" in dur_unit_lower:
+                duration_s = d * 60.0
+            elif "sec" in dur_unit_lower or dur_unit_lower == "s":
+                duration_s = d
+            elif "hr" in dur_unit_lower or "hour" in dur_unit_lower:
+                duration_s = d * 3600.0
+    if duration_s is None and end_str:
+        try:
+            end_dt = _ah_parse_date(end_str)
+            duration_s = (end_dt - start_dt).total_seconds()
+        except ValueError:
+            pass
+
+    # Distance: prefer totalDistance attribute; fall back to WorkoutStatistics sum.
+    # In many Apple Watch exports totalDistance is absent and distance is stored in
+    # WorkoutStatistics (HKQuantityTypeIdentifierDistanceWalkingRunning etc.).
+    dist_m = _ah_dist_to_m(
+        elem.get("totalDistance"),
+        elem.get("totalDistanceUnit"),
+    )
+
+    # Calories
+    calories = _int(elem.get("totalEnergyBurned") or "")
+
+    # WorkoutStatistics sub-elements
+    avg_hr: int | None = None
+    max_hr: int | None = None
+    elev_gain_m: float | None = None
+
+    _DISTANCE_STAT_TYPES = {
+        "HKQuantityTypeIdentifierDistanceWalkingRunning",
+        "HKQuantityTypeIdentifierDistanceCycling",
+        "HKQuantityTypeIdentifierDistanceSwimming",
+        "HKQuantityTypeIdentifierDistanceDownhillSki",
+        "HKQuantityTypeIdentifierDistanceWheelchair",
+        "HKQuantityTypeIdentifierDistanceCrossCountrySkiing",
+        "HKQuantityTypeIdentifierDistancePaddleSports",
+        "HKQuantityTypeIdentifierDistanceRowing",
+        "HKQuantityTypeIdentifierDistanceSkatingSports",
+    }
+
+    for stat in elem.findall("WorkoutStatistics"):
+        stat_type = stat.get("type", "")
+        if stat_type in _DISTANCE_STAT_TYPES:
+            if dist_m is None:  # don't overwrite totalDistance if already set
+                dist_m = _ah_dist_to_m(stat.get("sum"), stat.get("unit"))
+        elif stat_type == "HKQuantityTypeIdentifierHeartRate":
+            avg_hr = _int(stat.get("average") or "")
+            max_hr = _int(stat.get("maximum") or "")
+        elif stat_type == "HKQuantityTypeIdentifierElevationAscended":
+            elev_gain_m = _ah_elev_to_m(stat.get("sum"), stat.get("unit"))
+        elif stat_type == "HKQuantityTypeIdentifierActiveEnergyBurned":
+            if calories is None:
+                calories = _int(stat.get("sum") or "")
+
+    # Skip zero/noise (≤ 9 m), BUT allow workouts without distance (strength etc.)
+    if dist_m is not None and dist_m <= 9:
+        return None
+
+    # Speed: derive from distance + duration if both present
+    avg_speed_ms: float | None = None
+    if dist_m and duration_s and duration_s > 0:
+        avg_speed_ms = dist_m / duration_s
+
+    # GPX route reference — path may start with "/" which we strip to make relative
+    gpx_rel: str | None = None
+    for route in elem.findall("WorkoutRoute"):
+        ref = route.find("FileReference")
+        if ref is not None:
+            p = ref.get("path", "")
+            gpx_rel = p.lstrip("/")  # "/workout-routes/foo.gpx" → "workout-routes/foo.gpx"
+            break
+
+    # UTC and local timestamps
+    utc_dt    = start_dt.astimezone(timezone.utc)
+    local_dt  = start_dt.replace(tzinfo=None)   # wall-clock local time
+    start_utc_str   = utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    start_local_str = local_dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+    # Synthetic ID: source + UTC timestamp (stable regardless of export TZ)
+    id_slug = utc_dt.strftime("%Y%m%dT%H%M%SZ")
+    garmin_activity_id = f"applehealth_{id_slug}"
+
+    source_name = elem.get("sourceName", "")
+    activity_name = f"{activity_type} {start_local_str[:10]}"
+
+    return {
+        "garmin_activity_id": garmin_activity_id,
+        "activity_name":      activity_name,
+        "activity_type":      activity_type,
+        "start_utc":          start_utc_str,
+        "start_local":        start_local_str,
+        "duration_s":         duration_s,
+        "dist_m":             dist_m,
+        "avg_speed_ms":       avg_speed_ms,
+        "elev_gain_m":        elev_gain_m,
+        "avg_hr":             avg_hr,
+        "max_hr":             max_hr,
+        "calories":           calories,
+        "gpx_rel":            gpx_rel,        # relative path inside export dir
+        "source_name":        source_name,
+    }
+
+
+def import_applehealth_activities(
+    export_dir: Path,
+    db_path: Path,
+    start_date: datetime | None,
+    end_date: datetime | None,
+    user_id: int,
+    dry_run: bool,
+    init_db: bool,
+    gpx_dest: Path | None,
+    overwrite_gpx: bool,
+) -> None:
+    # Apple Health uses "export.xml" or "Export.xml" depending on the device locale
+    xml_path = export_dir / "export.xml"
+    if not xml_path.exists():
+        xml_path = export_dir / "Export.xml"
+    if not xml_path.exists():
+        sys.exit(f"ERROR: export.xml not found in {export_dir}. Extract Apple Health export.zip first.")
+
+    # --- DB connection ---
+    if dry_run:
+        if db_path.exists():
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            check_prerequisites(conn, user_id)
+        else:
+            if not init_db:
+                sys.exit(
+                    f"ERROR: database file not found: {db_path}\n"
+                    f"       Run with --init-db to create it on first use."
+                )
+            conn = sqlite3.connect(":memory:")
+            init_schema(conn)
+            conn.execute("INSERT OR IGNORE INTO users (id, name) VALUES (?, 'default')", (user_id,))
+            conn.commit()
+    else:
+        if not db_path.exists() and not init_db:
+            sys.exit(
+                f"ERROR: database file not found: {db_path}\n"
+                f"       Run with --init-db to create it on first use."
+            )
+        conn = sqlite3.connect(db_path)
+        if init_db:
+            init_schema(conn)
+            conn.execute("INSERT OR IGNORE INTO users (id, name) VALUES (?, 'default')", (user_id,))
+            conn.commit()
+        check_prerequisites(conn, user_id)
+        migrate_schema(conn)
+
+    existing_ids: set[str] = set()
+    existing_list: list[dict] = []
+    cross_claimed_ids: set[int] = set()
+    for r in conn.execute(
+        "SELECT garmin_activity_id, id, start_time_local, start_time_utc, distance_m, activity_name "
+        "FROM activities WHERE user_id = ?",
+        (user_id,),
+    ):
+        existing_ids.add(r[0])
+        _dt_local = _parse_ts(r[2])
+        existing_list.append({
+            "id": r[1], "start_time_local": r[2], "start_time_utc": r[3],
+            "distance_m": r[4], "activity_name": r[5],
+            "dt_local": _dt_local,
+            "date_only": bool(_dt_local and _dt_local.hour == 0 and _dt_local.minute == 0 and _dt_local.second == 0),
+        })
+
+    n_new = n_skipped = n_cross_dup = n_date_filtered = n_skipped_invalid = n_parse_error = 0
+    n_workout = 0
+    synced_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    if gpx_dest and not dry_run:
+        gpx_dest.mkdir(parents=True, exist_ok=True)
+
+    print(f"Parsing {xml_path} (this may take a while for large exports)…")
+
+    # Use iterparse for memory efficiency — export.xml can exceed 1 GB.
+    # We clear high-volume leaf elements (Record, ActivitySummary, etc.) immediately
+    # to save memory, but leave Workout children (WorkoutStatistics, WorkoutRoute)
+    # intact until after the parent Workout element has been fully processed.
+    _CLEAR_TAGS = frozenset({
+        "Record", "ActivitySummary", "ExportDate", "Me",
+        "InstantaneousBeatsPerMinute", "HeartRateVariabilityMetadataList",
+    })
+    for event, elem in ET.iterparse(xml_path, events=("end",)):
+        if elem.tag in _CLEAR_TAGS:
+            elem.clear()
+            continue
+        if elem.tag != "Workout":
+            continue
+
+        n_workout += 1
+        try:
+            d = _parse_applehealth_workout(elem)
+        except Exception as exc:
+            print(f"  ERROR workout #{n_workout}: parse error — {exc}", file=sys.stderr)
+            n_parse_error += 1
+            elem.clear()
+            continue
+
+        elem.clear()  # free memory immediately after parsing
+
+        if d is None:
+            n_skipped_invalid += 1
+            continue
+
+        # --- date filter ---
+        try:
+            dt = datetime.fromisoformat(d["start_local"])
+        except ValueError:
+            print(f"  ERROR workout #{n_workout}: bad date {d['start_local']!r}", file=sys.stderr)
+            n_parse_error += 1
+            continue
+        if start_date and dt < start_date:
+            n_date_filtered += 1
+            continue
+        if end_date and dt > end_date:
+            n_date_filtered += 1
+            continue
+
+        # --- exact duplicate check ---
+        if d["garmin_activity_id"] in existing_ids:
+            n_skipped += 1
+            continue
+
+        # --- cross-source duplicate check (±2 h window + distance) ---
+        # Only run distance-based cross-dup when we actually have a distance
+        if d["dist_m"] is not None:
+            cross_dup = _find_cross_source_duplicate(
+                existing_list, cross_claimed_ids,
+                d["start_local"], d["dist_m"],
+                date_only=False,
+                window_h=2.0,
+            )
+            if cross_dup is not None:
+                cross_claimed_ids.add(cross_dup["id"])
+                n_cross_dup += 1
+                print(
+                    f"  CROSS-DUP    {d['activity_name']!r:45s} {d['start_local']}"
+                    f"  ≈ {cross_dup.get('activity_name')!r}"
+                    f"  dist {d['dist_m']:.0f}m ≈ {cross_dup['distance_m']:.0f}m"
+                )
+                continue
+
+        if dry_run:
+            n_new += 1
+            continue
+
+        # --- GPX copy ---
+        gpx_path_dest: str | None = None
+        if d["gpx_rel"] and gpx_dest:
+            src_gpx = export_dir / d["gpx_rel"]
+            if src_gpx.exists():
+                dst_gpx = gpx_dest / src_gpx.name
+                if dst_gpx.exists() and not overwrite_gpx:
+                    print(f"  GPX-EXISTS   {dst_gpx} (use --overwrite-gpx to replace)")
+                else:
+                    shutil.copy2(src_gpx, dst_gpx)
+                gpx_path_dest = str(dst_gpx)
+
+        # --- insert ---
+        raw_json = json.dumps(
+            {k: v for k, v in {"applehealth_source": d["source_name"]}.items() if v},
+            ensure_ascii=False,
+        )
+        try:
+            conn.execute(
+                """
+                INSERT INTO activities (
+                    user_id, garmin_activity_id,
+                    activity_name, activity_type, sport_type,
+                    start_time_utc, start_time_local,
+                    duration_s, elapsed_time_s, moving_time_s,
+                    distance_m, elevation_gain_m,
+                    avg_speed_ms,
+                    avg_hr, max_hr,
+                    calories,
+                    gpx_path,
+                    raw_json, source, synced_at
+                ) VALUES (
+                    ?,?,  ?,?,?,  ?,?,  ?,?,?,  ?,?,  ?,  ?,?,  ?,  ?,  ?,?,?
+                )
+                """,
+                (
+                    user_id, d["garmin_activity_id"],
+                    d["activity_name"], d["activity_type"], d["activity_type"],
+                    d["start_utc"], d["start_local"],
+                    d["duration_s"], d["duration_s"], d["duration_s"],
+                    d["dist_m"], d["elev_gain_m"],
+                    d["avg_speed_ms"],
+                    d["avg_hr"], d["max_hr"],
+                    d["calories"],
+                    gpx_path_dest,
+                    raw_json, "AppleHealth-Import", synced_at,
+                ),
+            )
+            conn.commit()
+            existing_ids.add(d["garmin_activity_id"])
+            n_new += 1
+        except Exception as exc:
+            print(
+                f"  ERROR {d['garmin_activity_id']}: {exc}",
+                file=sys.stderr,
+            )
+            n_parse_error += 1
+
+    conn.close()
+
+    # --- summary ---
+    if dry_run:
+        print("DRY-RUN — nothing was written.\n")
+    print(f"\nDone.")
+    print(f"  Workouts found        : {n_workout}")
+    print(f"  Imported              : {n_new}")
+    print(f"  Skipped (duplicate)   : {n_skipped}  (already in DB, same source)")
+    print(f"  Skipped (cross-source): {n_cross_dup}  (same time ±2h + distance already in DB)")
+    print(f"  Skipped (invalid)     : {n_skipped_invalid}  (zero/noise distance or bad date)")
+    print(f"  Outside dates         : {n_date_filtered}  (filtered out)")
+    print(f"  Errors                : {n_parse_error}")
+
+
+# ---------------------------------------------------------------------------
 # DailyMile import
 # ---------------------------------------------------------------------------
 
@@ -1846,11 +2314,16 @@ Examples:
   # Import DailyMile export folder
   python strava_import.py --dailymile dailymile_export/dailymile_export_NTQtMjkwODM5 --db garmin.db
 
+  # Import Apple Health export (unzipped export.zip)
+  python strava_import.py --applehealth apple_health_export --db garmin.db
+  python strava_import.py --applehealth apple_health_export --db garmin.db --gpx-dest data/gpx
+
   # Dry-run any import
   python strava_import.py --dump "Strava Dump 20260310" --db garmin.db --dry-run
   python strava_import.py --runmeter runmeter_data/Runmeter_Import.csv --db garmin.db --dry-run
   python strava_import.py --cyclemeter runmeter_data/Cyclemeter_Import.csv --db garmin.db --dry-run
   python strava_import.py --dailymile dailymile_export/dailymile_export_NTQtMjkwODM5 --db garmin.db --dry-run
+  python strava_import.py --applehealth apple_health_export --db garmin.db --dry-run
 """,
     )
     source_group = parser.add_mutually_exclusive_group(required=True)
@@ -1869,6 +2342,10 @@ Examples:
     source_group.add_argument(
         "--dailymile", metavar="DIR",
         help="Path to a DailyMile export folder (contains activities.csv and activities/).",
+    )
+    source_group.add_argument(
+        "--applehealth", metavar="DIR",
+        help="Path to an extracted Apple Health export folder (contains export.xml).",
     )
     parser.add_argument(
         "--db", required=True, metavar="FILE",
@@ -1938,7 +2415,32 @@ Examples:
         else:
             print("--backup: DB does not exist yet, skipping backup.\n")
 
-    if args.dailymile:
+    if args.applehealth:
+        export_dir = Path(args.applehealth)
+        if not export_dir.is_dir():
+            sys.exit(f"ERROR: Apple Health export directory not found: {export_dir}")
+        gpx_dest = Path(args.gpx_dest) if args.gpx_dest else None
+        print(f"Apple Health import")
+        print(f"  dir          : {export_dir}")
+        print(f"  db           : {db_path}")
+        print(f"  gpx-dest     : {gpx_dest or '(not copying)'}")
+        print(f"  dates        : {args.start_date or 'any'} → {args.end_date or 'any'}")
+        print(f"  user_id      : {args.user_id}")
+        print(f"  dry-run      : {args.dry_run}")
+        print(f"  init-db      : {args.init_db}")
+        print()
+        import_applehealth_activities(
+            export_dir=export_dir,
+            db_path=db_path,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            user_id=args.user_id,
+            dry_run=args.dry_run,
+            init_db=args.init_db,
+            gpx_dest=gpx_dest,
+            overwrite_gpx=args.overwrite_gpx,
+        )
+    elif args.dailymile:
         dump_dir = Path(args.dailymile)
         if not dump_dir.is_dir():
             sys.exit(f"ERROR: DailyMile directory not found: {dump_dir}")
