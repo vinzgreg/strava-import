@@ -61,6 +61,77 @@ COL = {
 
 GPX_NS = "http://www.topografix.com/GPX/1/1"
 
+# ---------------------------------------------------------------------------
+# Runmeter CSV column indices (0-based, semicolon-separated)
+# ---------------------------------------------------------------------------
+RUNMETER_COL = {
+    "date":          0,   # Tag (YYYY-MM-DD)
+    "type":          1,   # Aktivität (e.g. Lauf, Fahrrad)
+    "count":         2,   # Anzahl (1 = single activity; >1 = aggregated)
+    "dist_km":       3,   # Wegstrecke (km)  — decimal comma
+    # col 4: Laufzeit (H:MM:SS) — redundant, use col 5
+    "duration_s":    5,   # Laufzeit (Sek)
+    "elev_gain":     6,   # Aufstieg (Meter)
+    "elev_loss":     7,   # Abstieg (Meter)
+    "calories":      8,   # Kalorien
+    # cols 9-14: per-activity averages — skip
+    "avg_speed_kmh": 15,  # Durchschnittsgeschwindigkeit (km/h) — decimal comma
+    # col 16: Durchschnittstempo (M:SS) — redundant
+    # col 17: Durchschnittstempo (Sek) — redundant
+    "max_speed_kmh": 18,  # Schnellste Geschwindigkeit (km/h) — decimal comma
+    # col 19: Schnellstes Tempo (M:SS) — redundant
+    # col 20: Schnellstes Tempo (Sek) — redundant
+    "steps":         21,  # Schritte
+    "max_step_cad":  22,  # Schrittfrequenz Maximum (running, steps/min)
+    "avg_step_cad":  23,  # Schrittfrequenz Durchschnitt (running)
+    "max_hr":        24,  # Pulsfrequenz Maximum (bpm)
+    "avg_hr":        25,  # Pulsfrequenz Durchschnitt (bpm)
+    "max_ped_cad":   26,  # Trittfrequenz Maximum (cycling, rpm)
+    "avg_ped_cad":   27,  # Trittfrequenz Durchschnitt (cycling)
+    "max_power":     28,  # Leistung Maximum (Watt)
+    "avg_power":     29,  # Leistung Durchschnitt (Watt)
+    "norm_power":    30,  # Normierte Leistung (Watt)
+}
+
+_RUNMETER_CYCLING_KEYWORDS = {"fahrrad", "rad", "bike", "cycl", "ride", "velo", "gravel"}
+
+# ---------------------------------------------------------------------------
+# Cyclemeter CSV column indices (0-based, semicolon-separated)
+# Per-activity records with full datetime; Route name in col 0.
+# ---------------------------------------------------------------------------
+CYCLEMETER_COL = {
+    "route":         0,   # Route name → activity_name
+    "type":          1,   # Aktivität (e.g. Fahrrad)
+    "startzeit":     2,   # Startzeit (YYYY-MM-DD HH:MM:SS)
+    # col 3: Zeit (H:MM:SS) — redundant, use col 4
+    "moving_s":      4,   # Zeit (Sek) — moving time
+    # col 5: Pausenzeit (H:MM:SS) — redundant, use col 6
+    "pause_s":       6,   # Pausenzeit (Sek) — pause time; elapsed = moving + pause
+    "dist_km":       7,   # Wegstrecke (km) — decimal comma
+    "avg_speed_kmh": 8,   # Durchschnittsgeschwindigkeit (km/h) — decimal comma
+    # col 9/10: Durchschnittstempo — redundant
+    "elev_gain":     11,  # Aufstieg (Meter)
+    "elev_loss":     12,  # Abstieg (Meter)
+    "calories":      13,  # Kalorien
+    "max_speed_kmh": 14,  # Schnellste Geschwindigkeit (km/h) — decimal comma
+    # cols 15/16: Schnellstes Tempo — redundant
+    # cols 17-19: Schritte / Schrittfrequenz — always 0 in cycling export
+    "max_hr":        20,  # Pulsfrequenz Maximum (bpm)
+    "avg_hr":        21,  # Pulsfrequenz Durchschnitt (bpm)
+    "max_cad":       22,  # Trittfrequenz Maximum (rpm)
+    "avg_cad":       23,  # Trittfrequenz Durchschnitt (rpm)
+    "max_power":     24,  # Leistung Maximum (Watt)
+    "avg_power":     25,  # Leistung Durchschnitt (Watt)
+    "norm_power":    26,  # Normierte Leistung (Watt)
+    # col 27: Variabilitätsindex — skip
+    "intensity_f":   28,  # Intensitätsfaktor
+    "tss":           29,  # Wertung der Trainingsbelastung (TSS)
+    # cols 30-35: peak power intervals — skip
+    "bike":          36,  # Fahrrad (bike name) → raw_json
+    # col 37: Schuhe — skip
+    "notes":         38,  # Notizen → raw_json
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -230,6 +301,80 @@ def _find_missing_file_candidates(
     return results
 
 
+def _find_cross_source_duplicate(
+    existing_list: list[dict],
+    claimed_ids: set[int],
+    start_local: str | None,
+    dist_m: float | None,
+    date_only: bool = False,
+    window_h: float = 2.0,
+    dist_tol: float = 0.05,
+) -> dict | None:
+    """Find an existing activity likely representing the same real-world event.
+
+    Used for cross-source duplicate detection (e.g. Strava/Garmin vs Runmeter/Cyclemeter).
+
+    date_only=True  (Runmeter): only a date is available; matches on same calendar
+                                day + distance within dist_tol.
+    date_only=False (Cyclemeter): full timestamp available; matches within ±window_h
+                                  and distance within dist_tol.
+    dist_tol: maximum fractional distance difference accepted (default 5 %).
+    """
+    if not start_local or not dist_m:
+        return None
+
+    if date_only:
+        date_str = start_local[:10]  # YYYY-MM-DD
+        src_dt = None
+    else:
+        src_dt = _parse_ts(start_local)
+        if src_dt is None:
+            return None
+        date_str = None
+
+    best: dict | None = None
+    best_dist_diff = float("inf")
+
+    for ex in existing_list:
+        if ex["id"] in claimed_ids:
+            continue
+
+        ex_dist = ex.get("distance_m")
+        if not ex_dist:
+            continue
+
+        # --- Distance check (primary signal for cross-source matching) ---
+        dist_diff = abs(dist_m - ex_dist) / max(dist_m, ex_dist)
+        if dist_diff > dist_tol:
+            continue
+
+        # --- Time / date check ---
+        if date_only:
+            ex_local = ex.get("start_time_local") or ""
+            if ex_local[:10] != date_str:
+                continue
+        else:
+            ex_dts = [
+                dt for dt in (
+                    _parse_ts(ex.get("start_time_local")),
+                    _parse_ts(ex.get("start_time_utc")),
+                )
+                if dt is not None
+            ]
+            min_delta_h = min(
+                (abs((src_dt - e_dt).total_seconds()) / 3600.0 for e_dt in ex_dts),
+                default=None,
+            )
+            if min_delta_h is None or min_delta_h > window_h:
+                continue
+
+        if dist_diff < best_dist_diff:
+            best_dist_diff = dist_diff
+            best = ex
+
+    return best
+
+
 def _float(s: str) -> float | None:
     s = s.strip()
     if not s:
@@ -243,6 +388,53 @@ def _float(s: str) -> float | None:
 def _int(s: str) -> int | None:
     f = _float(s)
     return int(round(f)) if f is not None else None
+
+
+def _float_de(s: str) -> float | None:
+    """Parse a German decimal-comma float string (e.g. '8,80' → 8.8)."""
+    s = s.strip().replace(",", ".")
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _nz_int(s: str) -> int | None:
+    """Parse integer; return None for zero or empty (means 'not recorded')."""
+    v = _int(s)
+    return v if v else None
+
+
+def _nz_float_de(s: str) -> float | None:
+    """Parse German decimal float; return None for zero or empty."""
+    v = _float_de(s)
+    return v if v else None
+
+
+def rcol(row: list[str], key: str) -> str:
+    """Safe column accessor for Runmeter rows."""
+    idx = RUNMETER_COL[key]
+    return row[idx].strip() if idx < len(row) else ""
+
+
+def ccol(row: list[str], key: str) -> str:
+    """Safe column accessor for Cyclemeter rows."""
+    idx = CYCLEMETER_COL[key]
+    return row[idx].strip() if idx < len(row) else ""
+
+
+def _parse_cyclemeter_startzeit(s: str) -> str | None:
+    """Convert 'YYYY-MM-DD HH:MM:SS' → ISO 8601 'YYYY-MM-DDTHH:MM:SS'."""
+    s = s.strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        return dt.isoformat()
+    except ValueError:
+        return None
 
 
 def parse_local_date(s: str) -> str | None:
@@ -487,6 +679,152 @@ def _parse_row(row: list[str]) -> dict:
         "intensity_f":      _float(col(row, "intensity_f")),
         "steps":            _int(col(row, "steps")),
         "tss":              _float(col(row, "tss")),
+    }
+
+
+def _parse_runmeter_row(row: list[str]) -> dict:
+    """Extract and convert all fields from a Runmeter CSV row."""
+    date = rcol(row, "date")
+    activity_type = rcol(row, "type")
+    count = _int(rcol(row, "count")) or 1
+
+    dist_km = _float_de(rcol(row, "dist_km"))
+    dist_m = dist_km * 1000.0 if dist_km is not None else None
+
+    duration_s = _float(rcol(row, "duration_s"))
+
+    elev_gain = _float_de(rcol(row, "elev_gain"))
+    elev_loss = _float_de(rcol(row, "elev_loss"))
+    calories = _int(rcol(row, "calories")) or None
+
+    avg_speed_kmh = _float_de(rcol(row, "avg_speed_kmh"))
+    avg_speed_ms = avg_speed_kmh / 3.6 if avg_speed_kmh else None
+
+    max_speed_kmh = _float_de(rcol(row, "max_speed_kmh"))
+    max_speed_ms = max_speed_kmh / 3.6 if max_speed_kmh else None
+
+    steps = _nz_int(rcol(row, "steps"))
+    max_hr = _nz_int(rcol(row, "max_hr"))
+    avg_hr = _nz_int(rcol(row, "avg_hr"))
+
+    # Cadence: step frequency for running, pedal frequency for cycling
+    is_cycling = any(kw in activity_type.lower() for kw in _RUNMETER_CYCLING_KEYWORDS)
+    if is_cycling:
+        max_cad = _nz_int(rcol(row, "max_ped_cad"))
+        avg_cad = _nz_int(rcol(row, "avg_ped_cad"))
+    else:
+        max_cad = _nz_int(rcol(row, "max_step_cad"))
+        avg_cad = _nz_int(rcol(row, "avg_step_cad"))
+
+    max_power = _nz_float_de(rcol(row, "max_power"))
+    avg_power = _nz_float_de(rcol(row, "avg_power"))
+    norm_power = _nz_float_de(rcol(row, "norm_power"))
+
+    type_slug = activity_type.lower().replace(" ", "_")
+    garmin_activity_id = f"runmeter_{date}_{type_slug}"
+
+    return {
+        "garmin_activity_id": garmin_activity_id,
+        "activity_name":      f"{activity_type} {date}",
+        "activity_type":      activity_type,
+        "start_local":        f"{date}T00:00:00",
+        "duration_s":         duration_s,
+        "dist_m":             dist_m,
+        "elev_gain":          elev_gain,
+        "elev_loss":          elev_loss,
+        "avg_speed_ms":       avg_speed_ms,
+        "max_speed_ms":       max_speed_ms,
+        "avg_hr":             avg_hr,
+        "max_hr":             max_hr,
+        "avg_cad":            avg_cad,
+        "max_cad":            max_cad,
+        "avg_power":          avg_power,
+        "max_power":          max_power,
+        "norm_power":         norm_power,
+        "calories":           calories,
+        "steps":              steps,
+        "count":              count,
+    }
+
+
+def _parse_cyclemeter_row(row: list[str]) -> dict | None:
+    """Extract and convert all fields from a Cyclemeter CSV row.
+
+    Returns None for rows that must be skipped:
+      - empty or unparseable Startzeit
+      - zero or missing distance
+    """
+    raw_startzeit = ccol(row, "startzeit")
+    start_local = _parse_cyclemeter_startzeit(raw_startzeit)
+    if start_local is None:
+        return None
+
+    dist_km = _float_de(ccol(row, "dist_km"))
+    if not dist_km:
+        return None  # zero-distance recording error
+    dist_m = dist_km * 1000.0
+
+    route = ccol(row, "route")
+    activity_type_raw = ccol(row, "type")
+    activity_type = activity_type_raw if activity_type_raw else "Fahrrad"
+
+    moving_s = _float(ccol(row, "moving_s"))
+    pause_s = _float(ccol(row, "pause_s")) or 0.0
+    elapsed_s = (moving_s or 0.0) + pause_s
+
+    elev_gain = _float_de(ccol(row, "elev_gain"))
+    elev_loss = _float_de(ccol(row, "elev_loss"))
+    calories = _int(ccol(row, "calories")) or None
+
+    avg_speed_kmh = _float_de(ccol(row, "avg_speed_kmh"))
+    avg_speed_ms = avg_speed_kmh / 3.6 if avg_speed_kmh else None
+
+    max_speed_kmh = _float_de(ccol(row, "max_speed_kmh"))
+    max_speed_ms = max_speed_kmh / 3.6 if max_speed_kmh else None
+
+    max_hr    = _nz_int(ccol(row, "max_hr"))
+    avg_hr    = _nz_int(ccol(row, "avg_hr"))
+    max_cad   = _nz_int(ccol(row, "max_cad"))
+    avg_cad   = _nz_int(ccol(row, "avg_cad"))
+    max_power = _nz_float_de(ccol(row, "max_power"))
+    avg_power = _nz_float_de(ccol(row, "avg_power"))
+    norm_power = _nz_float_de(ccol(row, "norm_power"))
+    intensity_f = _nz_float_de(ccol(row, "intensity_f"))
+    tss = _nz_float_de(ccol(row, "tss"))
+
+    bike  = ccol(row, "bike")
+    notes = ccol(row, "notes")
+
+    # Synthetic unique ID from timestamp (colons replaced to be filename-safe)
+    ts_slug = raw_startzeit.replace(" ", "T").replace(":", "-")
+    garmin_activity_id = f"cyclemeter_{ts_slug}"
+
+    activity_name = route if route else f"{activity_type} {raw_startzeit[:10]}"
+
+    return {
+        "garmin_activity_id": garmin_activity_id,
+        "activity_name":      activity_name,
+        "activity_type":      activity_type,
+        "start_local":        start_local,
+        "moving_s":           moving_s,
+        "elapsed_s":          elapsed_s or None,
+        "dist_m":             dist_m,
+        "elev_gain":          elev_gain,
+        "elev_loss":          elev_loss,
+        "avg_speed_ms":       avg_speed_ms,
+        "max_speed_ms":       max_speed_ms,
+        "avg_hr":             avg_hr,
+        "max_hr":             max_hr,
+        "avg_cad":            avg_cad,
+        "max_cad":            max_cad,
+        "avg_power":          avg_power,
+        "max_power":          max_power,
+        "norm_power":         norm_power,
+        "intensity_f":        intensity_f,
+        "tss":                tss,
+        "calories":           calories,
+        "bike":               bike if bike and bike.lower() != "keine" else None,
+        "notes":              notes if notes else None,
     }
 
 
@@ -828,6 +1166,367 @@ def import_activities(
 
 
 # ---------------------------------------------------------------------------
+# Runmeter import
+# ---------------------------------------------------------------------------
+
+def import_runmeter_activities(
+    csv_path: Path,
+    db_path: Path,
+    start_date: datetime | None,
+    end_date: datetime | None,
+    user_id: int,
+    dry_run: bool,
+    init_db: bool,
+) -> None:
+    if not csv_path.exists():
+        sys.exit(f"ERROR: {csv_path} not found.")
+
+    # --- DB connection (same logic as import_activities) ---
+    if dry_run:
+        if db_path.exists():
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            check_prerequisites(conn, user_id)
+        else:
+            if not init_db:
+                sys.exit(
+                    f"ERROR: database file not found: {db_path}\n"
+                    f"       Run with --init-db to create it on first use."
+                )
+            conn = sqlite3.connect(":memory:")
+            init_schema(conn)
+            conn.execute("INSERT OR IGNORE INTO users (id, name) VALUES (?, 'default')", (user_id,))
+            conn.commit()
+    else:
+        if not db_path.exists() and not init_db:
+            sys.exit(
+                f"ERROR: database file not found: {db_path}\n"
+                f"       Run with --init-db to create it on first use."
+            )
+        conn = sqlite3.connect(db_path)
+        if init_db:
+            init_schema(conn)
+            conn.execute("INSERT OR IGNORE INTO users (id, name) VALUES (?, 'default')", (user_id,))
+            conn.commit()
+        check_prerequisites(conn, user_id)
+        migrate_schema(conn)
+
+    # Pre-load existing activities for ID and cross-source duplicate detection
+    existing_ids: set[str] = set()
+    existing_list: list[dict] = []
+    cross_claimed_ids: set[int] = set()
+    for r in conn.execute(
+        "SELECT garmin_activity_id, id, start_time_local, start_time_utc, distance_m, activity_name "
+        "FROM activities WHERE user_id = ?",
+        (user_id,),
+    ):
+        existing_ids.add(r[0])
+        existing_list.append({
+            "id": r[1], "start_time_local": r[2], "start_time_utc": r[3],
+            "distance_m": r[4], "activity_name": r[5],
+        })
+
+    n_new = n_skipped = n_cross_dup = n_date_filtered = n_parse_error = 0
+    synced_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        reader = csv.reader(fh, delimiter=";")
+        next(reader)  # skip header
+
+        for lineno, row in enumerate(reader, start=2):
+            if not row or not row[0].strip():
+                continue
+
+            try:
+                d = _parse_runmeter_row(row)
+            except Exception as exc:
+                print(f"  ERROR line {lineno}: parse error — {exc}", file=sys.stderr)
+                n_parse_error += 1
+                continue
+
+            # --- date filter ---
+            try:
+                dt = datetime.fromisoformat(d["start_local"])
+            except ValueError:
+                print(f"  ERROR line {lineno}: bad date {d['start_local']!r}", file=sys.stderr)
+                n_parse_error += 1
+                continue
+            if start_date and dt < start_date:
+                n_date_filtered += 1
+                continue
+            if end_date and dt > end_date:
+                n_date_filtered += 1
+                continue
+
+            # --- exact duplicate check ---
+            if d["garmin_activity_id"] in existing_ids:
+                n_skipped += 1
+                continue
+
+            # --- cross-source duplicate check (same calendar day + distance) ---
+            cross_dup = _find_cross_source_duplicate(
+                existing_list, cross_claimed_ids,
+                d["start_local"], d["dist_m"],
+                date_only=True,
+            )
+            if cross_dup is not None:
+                cross_claimed_ids.add(cross_dup["id"])
+                n_cross_dup += 1
+                print(
+                    f"  CROSS-DUP    {d['activity_name']!r:45s} {d['start_local'][:10]}"
+                    f"  ≈ {cross_dup.get('activity_name')!r}"
+                    f"  dist {d['dist_m']:.0f}m ≈ {cross_dup['distance_m']:.0f}m"
+                )
+                continue
+
+            if dry_run:
+                n_new += 1
+                continue
+
+            # --- insert ---
+            raw_json = json.dumps({"runmeter_count": d["count"]}, ensure_ascii=False)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO activities (
+                        user_id, garmin_activity_id,
+                        activity_name, activity_type, sport_type,
+                        start_time_local,
+                        duration_s, elapsed_time_s, moving_time_s,
+                        distance_m, elevation_gain_m, elevation_loss_m,
+                        avg_speed_ms, max_speed_ms,
+                        avg_hr, max_hr,
+                        avg_power_w, max_power_w, normalized_power_w,
+                        avg_cadence, max_cadence,
+                        calories, steps,
+                        raw_json, source, synced_at
+                    ) VALUES (
+                        ?,?,  ?,?,?,  ?,  ?,?,?,  ?,?,?,  ?,?,  ?,?,  ?,?,?,  ?,?,  ?,?,  ?,?,?
+                    )
+                    """,
+                    (
+                        user_id, d["garmin_activity_id"],
+                        d["activity_name"], d["activity_type"], d["activity_type"],
+                        d["start_local"],
+                        d["duration_s"], d["duration_s"], d["duration_s"],
+                        d["dist_m"], d["elev_gain"], d["elev_loss"],
+                        d["avg_speed_ms"], d["max_speed_ms"],
+                        d["avg_hr"], d["max_hr"],
+                        d["avg_power"], d["max_power"], d["norm_power"],
+                        d["avg_cad"], d["max_cad"],
+                        d["calories"], d["steps"],
+                        raw_json, "Runmeter-Import", synced_at,
+                    ),
+                )
+                conn.commit()
+                existing_ids.add(d["garmin_activity_id"])
+                n_new += 1
+            except Exception as exc:
+                print(
+                    f"  ERROR line {lineno} {d['garmin_activity_id']}: {exc}",
+                    file=sys.stderr,
+                )
+                n_parse_error += 1
+
+    conn.close()
+
+    # --- summary ---
+    if dry_run:
+        print("DRY-RUN — nothing was written.\n")
+    print(f"\nDone.")
+    print(f"  Imported              : {n_new}")
+    print(f"  Skipped (duplicate)   : {n_skipped}  (already in DB, same source)")
+    print(f"  Skipped (cross-source): {n_cross_dup}  (same day + distance already in DB)")
+    print(f"  Outside dates         : {n_date_filtered}  (filtered out)")
+    print(f"  Errors                : {n_parse_error}")
+
+
+# ---------------------------------------------------------------------------
+# Cyclemeter import
+# ---------------------------------------------------------------------------
+
+def import_cyclemeter_activities(
+    csv_path: Path,
+    db_path: Path,
+    start_date: datetime | None,
+    end_date: datetime | None,
+    user_id: int,
+    dry_run: bool,
+    init_db: bool,
+) -> None:
+    if not csv_path.exists():
+        sys.exit(f"ERROR: {csv_path} not found.")
+
+    # --- DB connection ---
+    if dry_run:
+        if db_path.exists():
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            check_prerequisites(conn, user_id)
+        else:
+            if not init_db:
+                sys.exit(
+                    f"ERROR: database file not found: {db_path}\n"
+                    f"       Run with --init-db to create it on first use."
+                )
+            conn = sqlite3.connect(":memory:")
+            init_schema(conn)
+            conn.execute("INSERT OR IGNORE INTO users (id, name) VALUES (?, 'default')", (user_id,))
+            conn.commit()
+    else:
+        if not db_path.exists() and not init_db:
+            sys.exit(
+                f"ERROR: database file not found: {db_path}\n"
+                f"       Run with --init-db to create it on first use."
+            )
+        conn = sqlite3.connect(db_path)
+        if init_db:
+            init_schema(conn)
+            conn.execute("INSERT OR IGNORE INTO users (id, name) VALUES (?, 'default')", (user_id,))
+            conn.commit()
+        check_prerequisites(conn, user_id)
+        migrate_schema(conn)
+
+    existing_ids: set[str] = set()
+    existing_list: list[dict] = []
+    cross_claimed_ids: set[int] = set()
+    for r in conn.execute(
+        "SELECT garmin_activity_id, id, start_time_local, start_time_utc, distance_m, activity_name "
+        "FROM activities WHERE user_id = ?",
+        (user_id,),
+    ):
+        existing_ids.add(r[0])
+        existing_list.append({
+            "id": r[1], "start_time_local": r[2], "start_time_utc": r[3],
+            "distance_m": r[4], "activity_name": r[5],
+        })
+
+    n_new = n_skipped = n_cross_dup = n_date_filtered = n_skipped_invalid = n_parse_error = 0
+    synced_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        reader = csv.reader(fh, delimiter=";")
+        next(reader)  # skip header
+
+        for lineno, row in enumerate(reader, start=2):
+            if not row or not row[0].strip():
+                continue
+
+            try:
+                d = _parse_cyclemeter_row(row)
+            except Exception as exc:
+                print(f"  ERROR line {lineno}: parse error — {exc}", file=sys.stderr)
+                n_parse_error += 1
+                continue
+
+            if d is None:
+                # empty startzeit or zero-distance — skip silently
+                n_skipped_invalid += 1
+                continue
+
+            # --- date filter ---
+            try:
+                dt = datetime.fromisoformat(d["start_local"])
+            except ValueError:
+                print(f"  ERROR line {lineno}: bad date {d['start_local']!r}", file=sys.stderr)
+                n_parse_error += 1
+                continue
+            if start_date and dt < start_date:
+                n_date_filtered += 1
+                continue
+            if end_date and dt > end_date:
+                n_date_filtered += 1
+                continue
+
+            # --- exact duplicate check ---
+            if d["garmin_activity_id"] in existing_ids:
+                n_skipped += 1
+                continue
+
+            # --- cross-source duplicate check (±2 h window + distance) ---
+            cross_dup = _find_cross_source_duplicate(
+                existing_list, cross_claimed_ids,
+                d["start_local"], d["dist_m"],
+                date_only=False,
+                window_h=2.0,
+            )
+            if cross_dup is not None:
+                cross_claimed_ids.add(cross_dup["id"])
+                n_cross_dup += 1
+                print(
+                    f"  CROSS-DUP    {d['activity_name']!r:45s} {d['start_local']}"
+                    f"  ≈ {cross_dup.get('activity_name')!r}"
+                    f"  dist {d['dist_m']:.0f}m ≈ {cross_dup['distance_m']:.0f}m"
+                )
+                continue
+
+            if dry_run:
+                n_new += 1
+                continue
+
+            # --- insert ---
+            raw_json = json.dumps(
+                {k: v for k, v in {"cyclemeter_bike": d["bike"], "cyclemeter_notes": d["notes"]}.items() if v},
+                ensure_ascii=False,
+            )
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO activities (
+                        user_id, garmin_activity_id,
+                        activity_name, activity_type, sport_type,
+                        start_time_local,
+                        duration_s, elapsed_time_s, moving_time_s,
+                        distance_m, elevation_gain_m, elevation_loss_m,
+                        avg_speed_ms, max_speed_ms,
+                        avg_hr, max_hr,
+                        avg_power_w, max_power_w, normalized_power_w,
+                        avg_cadence, max_cadence,
+                        intensity_factor, training_stress_score,
+                        calories,
+                        raw_json, source, synced_at
+                    ) VALUES (
+                        ?,?,  ?,?,?,  ?,  ?,?,?,  ?,?,?,  ?,?,  ?,?,  ?,?,?,  ?,?,  ?,?,  ?,  ?,?,?
+                    )
+                    """,
+                    (
+                        user_id, d["garmin_activity_id"],
+                        d["activity_name"], d["activity_type"], d["activity_type"],
+                        d["start_local"],
+                        d["elapsed_s"], d["elapsed_s"], d["moving_s"],
+                        d["dist_m"], d["elev_gain"], d["elev_loss"],
+                        d["avg_speed_ms"], d["max_speed_ms"],
+                        d["avg_hr"], d["max_hr"],
+                        d["avg_power"], d["max_power"], d["norm_power"],
+                        d["avg_cad"], d["max_cad"],
+                        d["intensity_f"], d["tss"],
+                        d["calories"],
+                        raw_json, "Cyclemeter-Import", synced_at,
+                    ),
+                )
+                conn.commit()
+                existing_ids.add(d["garmin_activity_id"])
+                n_new += 1
+            except Exception as exc:
+                print(
+                    f"  ERROR line {lineno} {d['garmin_activity_id']}: {exc}",
+                    file=sys.stderr,
+                )
+                n_parse_error += 1
+
+    conn.close()
+
+    # --- summary ---
+    if dry_run:
+        print("DRY-RUN — nothing was written.\n")
+    print(f"\nDone.")
+    print(f"  Imported              : {n_new}")
+    print(f"  Skipped (duplicate)   : {n_skipped}  (already in DB, same source)")
+    print(f"  Skipped (cross-source): {n_cross_dup}  (same time ±2h + distance already in DB)")
+    print(f"  Skipped (invalid)     : {n_skipped_invalid}  (empty timestamp or zero distance)")
+    print(f"  Outside dates         : {n_date_filtered}  (filtered out)")
+    print(f"  Errors                : {n_parse_error}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -842,21 +1541,37 @@ def parse_date(s: str) -> datetime:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Import a Strava data export into the garmin-sync SQLite database.",
+        description="Import a Strava or Runmeter export into the garmin-sync SQLite database.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Import everything
+  # Import Strava export
   python strava_import.py --dump "Strava Dump 20260310" --db garmin.db --gpx-dest data/gpx
 
-  # Import only 2022–2023, dry-run first
-  python strava_import.py --dump "Strava Dump 20260310" --db garmin.db \\
-      --gpx-dest data/gpx --start-date 2022-01-01 --end-date 2023-12-31 --dry-run
+  # Import Runmeter CSV
+  python strava_import.py --runmeter runmeter_data/Runmeter_Import.csv --db garmin.db
+
+  # Import Cyclemeter CSV
+  python strava_import.py --cyclemeter runmeter_data/Cyclemeter_Import.csv --db garmin.db
+
+  # Dry-run any import
+  python strava_import.py --dump "Strava Dump 20260310" --db garmin.db --dry-run
+  python strava_import.py --runmeter runmeter_data/Runmeter_Import.csv --db garmin.db --dry-run
+  python strava_import.py --cyclemeter runmeter_data/Cyclemeter_Import.csv --db garmin.db --dry-run
 """,
     )
-    parser.add_argument(
-        "--dump", required=True, metavar="DIR",
+    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group.add_argument(
+        "--dump", metavar="DIR",
         help="Path to the Strava export folder (contains activities.csv and activities/).",
+    )
+    source_group.add_argument(
+        "--runmeter", metavar="FILE",
+        help="Path to a Runmeter CSV export file.",
+    )
+    source_group.add_argument(
+        "--cyclemeter", metavar="FILE",
+        help="Path to a Cyclemeter CSV export file.",
     )
     parser.add_argument(
         "--db", required=True, metavar="FILE",
@@ -914,26 +1629,7 @@ Examples:
 
     args = parser.parse_args()
 
-    dump_dir = Path(args.dump)
-    if not dump_dir.is_dir():
-        sys.exit(f"ERROR: dump directory not found: {dump_dir}")
-
-    db_path  = Path(args.db)
-    gpx_dest = Path(args.gpx_dest) if args.gpx_dest else None
-    fit_dest = Path(args.fit_dest) if args.fit_dest else None
-
-    print(f"Strava import")
-    print(f"  dump         : {dump_dir}")
-    print(f"  db           : {db_path}")
-    print(f"  gpx-dest     : {gpx_dest or '(not copying)'}")
-    print(f"  fit-dest     : {fit_dest or '(not copying)'}")
-    print(f"  dates        : {args.start_date or 'any'} → {args.end_date or 'any'}")
-    print(f"  user_id      : {args.user_id}")
-    print(f"  dry-run      : {args.dry_run}")
-    print(f"  init-db      : {args.init_db}")
-    print(f"  backup       : {args.backup}")
-    print(f"  overwrite-gpx: {args.overwrite_gpx}")
-    print()
+    db_path = Path(args.db)
 
     # --- DB backup ---
     if args.backup and not args.dry_run:
@@ -945,18 +1641,60 @@ Examples:
         else:
             print("--backup: DB does not exist yet, skipping backup.\n")
 
-    import_activities(
-        dump_dir=dump_dir,
-        db_path=db_path,
-        gpx_dest=gpx_dest,
-        fit_dest=fit_dest,
-        start_date=args.start_date,
-        end_date=args.end_date,
-        user_id=args.user_id,
-        dry_run=args.dry_run,
-        overwrite_gpx=args.overwrite_gpx,
-        init_db=args.init_db,
-    )
+    if args.runmeter or args.cyclemeter:
+        is_cyclemeter = bool(args.cyclemeter)
+        csv_path = Path(args.cyclemeter if is_cyclemeter else args.runmeter)
+        label = "Cyclemeter" if is_cyclemeter else "Runmeter"
+        print(f"{label} import")
+        print(f"  csv          : {csv_path}")
+        print(f"  db           : {db_path}")
+        print(f"  dates        : {args.start_date or 'any'} → {args.end_date or 'any'}")
+        print(f"  user_id      : {args.user_id}")
+        print(f"  dry-run      : {args.dry_run}")
+        print(f"  init-db      : {args.init_db}")
+        print()
+        fn = import_cyclemeter_activities if is_cyclemeter else import_runmeter_activities
+        fn(
+            csv_path=csv_path,
+            db_path=db_path,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            user_id=args.user_id,
+            dry_run=args.dry_run,
+            init_db=args.init_db,
+        )
+    else:
+        dump_dir = Path(args.dump)
+        if not dump_dir.is_dir():
+            sys.exit(f"ERROR: dump directory not found: {dump_dir}")
+
+        gpx_dest = Path(args.gpx_dest) if args.gpx_dest else None
+        fit_dest = Path(args.fit_dest) if args.fit_dest else None
+
+        print(f"Strava import")
+        print(f"  dump         : {dump_dir}")
+        print(f"  db           : {db_path}")
+        print(f"  gpx-dest     : {gpx_dest or '(not copying)'}")
+        print(f"  fit-dest     : {fit_dest or '(not copying)'}")
+        print(f"  dates        : {args.start_date or 'any'} → {args.end_date or 'any'}")
+        print(f"  user_id      : {args.user_id}")
+        print(f"  dry-run      : {args.dry_run}")
+        print(f"  init-db      : {args.init_db}")
+        print(f"  backup       : {args.backup}")
+        print(f"  overwrite-gpx: {args.overwrite_gpx}")
+        print()
+        import_activities(
+            dump_dir=dump_dir,
+            db_path=db_path,
+            gpx_dest=gpx_dest,
+            fit_dest=fit_dest,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            user_id=args.user_id,
+            dry_run=args.dry_run,
+            overwrite_gpx=args.overwrite_gpx,
+            init_db=args.init_db,
+        )
 
 
 if __name__ == "__main__":

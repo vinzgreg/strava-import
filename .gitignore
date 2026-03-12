@@ -16,6 +16,7 @@ strava_data/
 *.gpx
 *.fit
 *.fit.gz
+*.csv
 
 # macOS
 .DS_Store
