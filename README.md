@@ -1,4 +1,56 @@
-# strava_import.py
+# sport-import
+
+A collection of tools for importing and visualising sports activities in the garmin-sync SQLite database.
+
+---
+
+## web_dashboard.py — Activity Dashboard
+
+A responsive Flask web app for visualising long-term training trends.
+
+### Features
+
+- **Multi-user** — select any user via dropdown
+- **Flexible activity types** — multi-select with free combination (handles un-normalised German/English type names)
+- **Smart metric mode** — automatically switches between pace (min/km) for running and speed (km/h) for cycling; elevation chart only shown for cycling
+- **Three time granularities** — week, month, or year
+- **Year filter** — include any subset of available years
+- **Charts** — distance + activity count · pace or speed (avg, best, trend) · elevation (cycling)
+- **Stat cards** — total distance, activity count, avg and best pace/speed
+- **Mastodon export** — formatted text block + downloadable 1080×1080 social card PNG
+
+### Requirements
+
+Python 3.10+ and Flask:
+
+```bash
+pip install flask
+# or
+pip install -r requirements.txt
+```
+
+### Running
+
+```bash
+python3 web_dashboard.py
+# → http://localhost:5000
+```
+
+The app reads from `~/data/garminnostra/garmin_nostra.db` by default.
+To use a different path, edit `DB_PATH` at the top of `web_dashboard.py`.
+
+### Defaults on load
+
+| Setting | Default |
+|---|---|
+| User | id=1 (vinz) |
+| Activity types | All types containing "run" or "lauf" |
+| Group by | Month |
+| Years | All available years |
+
+---
+
+## strava_import.py
 
 A command-line tool that imports activities from a **Strava data export** into the
 [garmin-sync](../garmin-sync/) SQLite database.

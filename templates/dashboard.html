@@ -1,0 +1,842 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sport Dashboard</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/tom-select@2.3.1/dist/css/tom-select.bootstrap5.min.css" rel="stylesheet">
+  <style>
+    :root {
+      --accent-run:    #FF6B35;
+      --accent-cycle:  #00B4D8;
+      --accent-mixed:  #A855F7;
+      --accent:        var(--accent-run);
+      --card-bg:       #1a1d27;
+      --border-color:  #2d3148;
+    }
+    body { background: #0f1117; }
+
+    /* ── Filter bar ─────────────────────────────────────────────── */
+    #filter-bar {
+      background: var(--card-bg);
+      border-bottom: 1px solid var(--border-color);
+      padding: .75rem 1rem;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    #filter-bar .form-label { font-size: .75rem; color: #94a3b8; margin-bottom: .2rem; }
+
+    /* ── Stat cards ─────────────────────────────────────────────── */
+    .stat-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border-color);
+      border-radius: .5rem;
+      padding: 1rem 1.25rem;
+    }
+    .stat-card .label { font-size: .75rem; color: #94a3b8; text-transform: uppercase; letter-spacing: .05em; }
+    .stat-card .value { font-size: 1.75rem; font-weight: 700; color: var(--accent); line-height: 1.1; }
+    .stat-card .sub   { font-size: .8rem; color: #64748b; }
+
+    /* ── Chart wrappers ─────────────────────────────────────────── */
+    .chart-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border-color);
+      border-radius: .5rem;
+      padding: 1rem 1.25rem;
+    }
+    .chart-title { font-size: .85rem; color: #94a3b8; text-transform: uppercase; letter-spacing: .05em; margin-bottom: .5rem; }
+    .chart-wrap  { position: relative; }
+
+    /* ── Navbar accent strip ────────────────────────────────────── */
+    #accent-strip { height: 4px; background: var(--accent); }
+
+    /* ── Tom Select tweaks ──────────────────────────────────────── */
+    .ts-wrapper.multi .ts-control { background: #12151e; border-color: var(--border-color); }
+    .ts-dropdown { background: #1a1d27; border-color: var(--border-color); }
+    .ts-dropdown .option.selected, .ts-dropdown .option:hover { background: #2d3148; }
+
+    /* ── Social card canvas ─────────────────────────────────────── */
+    #socialCanvas { max-width: 100%; border-radius: .5rem; }
+
+    /* ── Empty state ────────────────────────────────────────────── */
+    #empty-state { color: #64748b; }
+  </style>
+</head>
+<body>
+
+<!-- Accent strip -->
+<div id="accent-strip"></div>
+
+<!-- Navbar -->
+<nav class="navbar navbar-dark px-3 py-2" style="background: #12151e;">
+  <span class="navbar-brand fw-bold fs-5">⚡ Sport Dashboard</span>
+  <button class="btn btn-sm btn-outline-secondary" data-bs-toggle="modal" data-bs-target="#exportModal">
+    ↗ Export
+  </button>
+</nav>
+
+<!-- Filter bar -->
+<div id="filter-bar">
+  <div class="row g-2 align-items-end">
+    <div class="col-6 col-sm-4 col-md-2">
+      <label class="form-label">User</label>
+      <select id="sel-user" class="form-select form-select-sm"></select>
+    </div>
+    <div class="col-12 col-sm-8 col-md-4">
+      <label class="form-label">Activity Types</label>
+      <select id="sel-types" multiple placeholder="Select types…"></select>
+    </div>
+    <div class="col-6 col-sm-4 col-md-2">
+      <label class="form-label">Group by</label>
+      <select id="sel-group" class="form-select form-select-sm">
+        <option value="week">Week</option>
+        <option value="month" selected>Month</option>
+        <option value="year">Year</option>
+      </select>
+    </div>
+    <div class="col-12 col-sm-8 col-md-3">
+      <label class="form-label">Years</label>
+      <select id="sel-years" multiple placeholder="All years"></select>
+    </div>
+    <div class="col-auto">
+      <button id="btn-apply" class="btn btn-sm btn-primary w-100">Apply</button>
+    </div>
+  </div>
+</div>
+
+<!-- Main content -->
+<div class="container-fluid px-3 py-3" id="main-content" style="display:none;">
+
+  <!-- Stat cards -->
+  <div class="row g-2 mb-3" id="stat-cards">
+    <div class="col-6 col-md-3">
+      <div class="stat-card h-100">
+        <div class="label">Total Distance</div>
+        <div class="value" id="card-dist">—</div>
+        <div class="sub">km</div>
+      </div>
+    </div>
+    <div class="col-6 col-md-3">
+      <div class="stat-card h-100">
+        <div class="label">Activities</div>
+        <div class="value" id="card-count">—</div>
+        <div class="sub" id="card-count-sub">total</div>
+      </div>
+    </div>
+    <div class="col-6 col-md-3">
+      <div class="stat-card h-100">
+        <div class="label" id="card-avg-label">Avg Pace</div>
+        <div class="value" id="card-avg">—</div>
+        <div class="sub" id="card-avg-sub">min/km</div>
+      </div>
+    </div>
+    <div class="col-6 col-md-3">
+      <div class="stat-card h-100">
+        <div class="label" id="card-best-label">Best Pace</div>
+        <div class="value" id="card-best">—</div>
+        <div class="sub" id="card-best-sub">min/km (fastest activity)</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Distance chart -->
+  <div class="chart-card mb-3">
+    <div class="chart-title">Distance per Period</div>
+    <div class="chart-wrap">
+      <canvas id="chart-distance" height="120"></canvas>
+    </div>
+  </div>
+
+  <!-- Pace / Speed chart -->
+  <div class="chart-card mb-3">
+    <div class="chart-title" id="pace-chart-title">Pace per Period</div>
+    <div class="chart-wrap">
+      <canvas id="chart-pace" height="120"></canvas>
+    </div>
+  </div>
+
+  <!-- Elevation chart (cycling only) -->
+  <div class="chart-card mb-3" id="elev-card" style="display:none;">
+    <div class="chart-title">Elevation Gain per Period</div>
+    <div class="chart-wrap">
+      <canvas id="chart-elev" height="90"></canvas>
+    </div>
+  </div>
+
+</div>
+
+<!-- Empty state -->
+<div id="empty-state" class="text-center py-5">
+  <div style="font-size:3rem;">🏃</div>
+  <p class="mt-2">Select filters and press Apply to load your data.</p>
+</div>
+
+<!-- ── Export Modal ────────────────────────────────────────────────── -->
+<div class="modal fade" id="exportModal" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-centered">
+    <div class="modal-content" style="background:#1a1d27; border-color:#2d3148;">
+      <div class="modal-header border-0">
+        <h5 class="modal-title">Export / Share</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <ul class="nav nav-tabs mb-3" id="exportTabs">
+          <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-text">Text (Mastodon)</button></li>
+          <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-image">Image Card</button></li>
+        </ul>
+        <div class="tab-content">
+
+          <!-- Text tab -->
+          <div class="tab-pane fade show active" id="tab-text">
+            <textarea id="export-text" class="form-control font-monospace"
+              rows="16" style="font-size:.8rem; background:#12151e; border-color:#2d3148; resize:vertical;" readonly></textarea>
+            <button class="btn btn-sm btn-outline-secondary mt-2" id="btn-copy-text">Copy to clipboard</button>
+            <span id="copy-confirm" class="ms-2 text-success" style="display:none;">Copied!</span>
+          </div>
+
+          <!-- Image tab -->
+          <div class="tab-pane fade" id="tab-image">
+            <div class="text-center">
+              <canvas id="socialCanvas"></canvas>
+            </div>
+            <div class="mt-2 text-center">
+              <button class="btn btn-sm btn-primary" id="btn-download-img">Download PNG</button>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Scripts ──────────────────────────────────────────────────────── -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tom-select@2.3.1/dist/js/tom-select.complete.min.js"></script>
+<script>
+// ── Constants ────────────────────────────────────────────────────────────
+const ACCENT = { running: '#FF6B35', cycling: '#00B4D8', mixed: '#A855F7' };
+const RUN_KW  = ['run', 'lauf', 'jog'];
+const CYC_KW  = ['rad', 'bike', 'cycl', 'ride', 'velo', 'gravel'];
+
+// ── State ────────────────────────────────────────────────────────────────
+let tsTypes = null;
+let tsYears = null;
+let currentData = null;
+let charts = { distance: null, pace: null, elev: null };
+
+// ── Utility ──────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+
+function fmtPace(speedMs) {
+  if (!speedMs || speedMs <= 0) return '—';
+  const mpk = 1000 / (speedMs * 60);
+  const m   = Math.floor(mpk);
+  const s   = String(Math.round((mpk - m) * 60)).padStart(2, '0');
+  return `${m}:${s}`;
+}
+
+function fmtSpeed(speedMs) {
+  if (!speedMs || speedMs <= 0) return '—';
+  return (speedMs * 3.6).toFixed(1);
+}
+
+function movingAvg(arr, n = 3) {
+  return arr.map((_, i) => {
+    const slice = arr.slice(Math.max(0, i - n + 1), i + 1).filter(v => v != null);
+    return slice.length ? slice.reduce((a, b) => a + b, 0) / slice.length : null;
+  });
+}
+
+function setAccent(mode) {
+  const color = ACCENT[mode] || ACCENT.running;
+  document.documentElement.style.setProperty('--accent', color);
+}
+
+function isDefaultRunType(t) {
+  return RUN_KW.some(k => t.toLowerCase().includes(k));
+}
+function isCycType(t) {
+  return CYC_KW.some(k => t.toLowerCase().includes(k));
+}
+
+function destroyChart(key) {
+  if (charts[key]) { charts[key].destroy(); charts[key] = null; }
+}
+
+// ── Axis formatters ──────────────────────────────────────────────────────
+function paceTickFmt(mode) {
+  return value => {
+    if (!value) return '';
+    if (mode === 'cycling') return (value * 3.6).toFixed(1) + ' km/h';
+    const mpk = 1000 / (value * 60);
+    const m   = Math.floor(mpk);
+    const s   = String(Math.round((mpk - m) * 60)).padStart(2, '0');
+    return `${m}:${s}`;
+  };
+}
+
+function paceTooltipFmt(mode, label) {
+  return (ctx) => {
+    const v = ctx.raw;
+    if (v == null) return null;
+    if (mode === 'cycling') return `${label}: ${fmtSpeed(v)} km/h`;
+    return `${label}: ${fmtPace(v)} /km`;
+  };
+}
+
+// ── Chart builders ───────────────────────────────────────────────────────
+function buildDistanceChart(data) {
+  destroyChart('distance');
+  const mode   = data.metric_mode;
+  const accent = ACCENT[mode] || ACCENT.running;
+  const ctx    = $('chart-distance').getContext('2d');
+
+  charts.distance = new Chart(ctx, {
+    data: {
+      labels: data.periods,
+      datasets: [
+        {
+          type: 'bar',
+          label: 'Distance (km)',
+          data: data.distance_km,
+          backgroundColor: accent + '99',
+          borderColor: accent,
+          borderWidth: 1,
+          yAxisID: 'yDist',
+          order: 2,
+        },
+        {
+          type: 'line',
+          label: 'Activities',
+          data: data.activity_count,
+          borderColor: '#94a3b8',
+          backgroundColor: 'transparent',
+          pointRadius: 2,
+          borderWidth: 1.5,
+          tension: 0.3,
+          yAxisID: 'yCount',
+          order: 1,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { labels: { color: '#94a3b8', boxWidth: 12 } },
+        tooltip: { callbacks: {
+          label: ctx => {
+            if (ctx.dataset.yAxisID === 'yDist') return ` ${ctx.formattedValue} km`;
+            return ` ${ctx.formattedValue} activities`;
+          }
+        }},
+      },
+      scales: {
+        x:      { ticks: { color: '#64748b', maxRotation: 45 }, grid: { color: '#1e2236' } },
+        yDist:  { position: 'left',  ticks: { color: '#94a3b8' }, grid: { color: '#1e2236' },
+                  title: { display: true, text: 'km', color: '#64748b' } },
+        yCount: { position: 'right', ticks: { color: '#64748b' }, grid: { display: false },
+                  title: { display: true, text: 'activities', color: '#64748b' } },
+      },
+    },
+  });
+}
+
+function buildPaceChart(data) {
+  destroyChart('pace');
+  const mode   = data.metric_mode;
+  const accent = ACCENT[mode] || ACCENT.running;
+  const isCyc  = mode === 'cycling';
+  const ctx    = $('chart-pace').getContext('2d');
+  const trend  = movingAvg(data.avg_speed_ms, 3);
+
+  $('pace-chart-title').textContent = isCyc ? 'Speed per Period' : 'Pace per Period';
+
+  charts.pace = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: data.periods,
+      datasets: [
+        {
+          label: isCyc ? 'Best ride avg speed' : 'Best activity pace',
+          data: data.best_speed_ms,
+          borderColor: accent,
+          backgroundColor: accent + '22',
+          fill: false,
+          pointRadius: 3,
+          borderWidth: 2,
+          tension: 0.3,
+          order: 1,
+        },
+        {
+          label: isCyc ? 'Avg speed' : 'Avg pace',
+          data: data.avg_speed_ms,
+          borderColor: '#06D6A0',
+          backgroundColor: '#06D6A022',
+          fill: false,
+          pointRadius: 3,
+          borderWidth: 2,
+          tension: 0.3,
+          order: 2,
+        },
+        {
+          label: isCyc ? 'Trend (3-period avg)' : 'Trend (3-period avg)',
+          data: trend,
+          borderColor: '#06D6A066',
+          backgroundColor: 'transparent',
+          fill: false,
+          pointRadius: 0,
+          borderWidth: 1.5,
+          borderDash: [5, 4],
+          tension: 0.4,
+          order: 3,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { labels: { color: '#94a3b8', boxWidth: 12 } },
+        tooltip: {
+          callbacks: {
+            label: ctx => {
+              const v = ctx.raw;
+              if (v == null) return null;
+              if (isCyc) return ` ${ctx.dataset.label}: ${fmtSpeed(v)} km/h`;
+              return ` ${ctx.dataset.label}: ${fmtPace(v)} /km`;
+            },
+          },
+        },
+      },
+      scales: {
+        x: { ticks: { color: '#64748b', maxRotation: 45 }, grid: { color: '#1e2236' } },
+        y: {
+          ticks: { color: '#94a3b8', callback: paceTickFmt(mode) },
+          grid:  { color: '#1e2236' },
+          title: { display: true, text: isCyc ? 'km/h' : 'min/km', color: '#64748b' },
+        },
+      },
+    },
+  });
+}
+
+function buildElevChart(data) {
+  destroyChart('elev');
+  const ctx = $('chart-elev').getContext('2d');
+  charts.elev = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: data.periods,
+      datasets: [{
+        label: 'Elevation gain (m)',
+        data: data.elevation_m,
+        backgroundColor: '#00B4D899',
+        borderColor: '#00B4D8',
+        borderWidth: 1,
+      }],
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        legend: { labels: { color: '#94a3b8', boxWidth: 12 } },
+        tooltip: { callbacks: { label: ctx => ` ${ctx.formattedValue} m` } },
+      },
+      scales: {
+        x: { ticks: { color: '#64748b', maxRotation: 45 }, grid: { color: '#1e2236' } },
+        y: { ticks: { color: '#94a3b8' }, grid: { color: '#1e2236' },
+             title: { display: true, text: 'm', color: '#64748b' } },
+      },
+    },
+  });
+}
+
+// ── Stat cards ────────────────────────────────────────────────────────────
+function updateStatCards(data) {
+  const { totals, metric_mode: mode } = data;
+  const isCyc = mode === 'cycling';
+
+  $('card-dist').textContent  = totals.distance_km.toLocaleString('de-DE', { maximumFractionDigits: 1 });
+  $('card-count').textContent = totals.activity_count.toLocaleString();
+
+  if (isCyc) {
+    $('card-avg-label').textContent  = 'Avg Speed';
+    $('card-avg-sub').textContent    = 'km/h';
+    $('card-best-label').textContent = 'Best Speed';
+    $('card-best-sub').textContent   = 'km/h (fastest ride avg)';
+    $('card-avg').textContent  = fmtSpeed(totals.avg_speed_ms);
+    $('card-best').textContent = fmtSpeed(totals.best_speed_ms);
+  } else {
+    $('card-avg-label').textContent  = 'Avg Pace';
+    $('card-avg-sub').textContent    = 'min/km';
+    $('card-best-label').textContent = 'Best Pace';
+    $('card-best-sub').textContent   = 'min/km (fastest activity)';
+    $('card-avg').textContent  = fmtPace(totals.avg_speed_ms);
+    $('card-best').textContent = fmtPace(totals.best_speed_ms);
+  }
+}
+
+// ── Main render ───────────────────────────────────────────────────────────
+function renderData(data) {
+  currentData = data;
+  setAccent(data.metric_mode);
+
+  $('empty-state').style.display   = 'none';
+  $('main-content').style.display  = '';
+
+  const showElev = data.metric_mode === 'cycling' && data.elevation_m.some(v => v > 0);
+  $('elev-card').style.display = showElev ? '' : 'none';
+
+  updateStatCards(data);
+  buildDistanceChart(data);
+  buildPaceChart(data);
+  if (showElev) buildElevChart(data);
+}
+
+// ── API calls ─────────────────────────────────────────────────────────────
+async function applyFilters() {
+  const userId = $('sel-user').value;
+  const types  = tsTypes  ? tsTypes.getValue()  : [];
+  const years  = tsYears  ? tsYears.getValue()  : [];
+  const group  = $('sel-group').value;
+
+  if (!userId || !types.length) {
+    alert('Please select a user and at least one activity type.');
+    return;
+  }
+
+  const btn = $('btn-apply');
+  btn.disabled    = true;
+  btn.textContent = '…';
+
+  const params = new URLSearchParams({
+    user_id: userId,
+    types:   types.join(','),
+    group:   group,
+    years:   years.join(','),
+  });
+
+  try {
+    const res  = await fetch(`/api/data?${params}`);
+    const data = await res.json();
+    renderData(data);
+  } catch (e) {
+    console.error(e);
+    alert('Failed to load data: ' + e.message);
+  } finally {
+    btn.disabled    = false;
+    btn.textContent = 'Apply';
+  }
+}
+
+async function loadActivityTypes(userId) {
+  if (tsTypes) { tsTypes.destroy(); tsTypes = null; }
+
+  const res   = await fetch(`/api/activity_types?user_id=${userId}`);
+  const types = await res.json();
+
+  const select = $('sel-types');
+  select.innerHTML = '';
+  types.forEach(t => {
+    const opt  = document.createElement('option');
+    opt.value  = t;
+    opt.text   = t;
+    select.appendChild(opt);
+  });
+
+  tsTypes = new TomSelect('#sel-types', {
+    plugins: ['checkbox_options', 'remove_button'],
+    maxOptions: null,
+    placeholder: 'Select types…',
+  });
+
+  // Default: pre-select run/lauf types
+  const defaults = types.filter(isDefaultRunType);
+  if (defaults.length) tsTypes.setValue(defaults);
+}
+
+async function loadYears(userId) {
+  if (tsYears) { tsYears.destroy(); tsYears = null; }
+
+  const res   = await fetch(`/api/years?user_id=${userId}`);
+  const years = await res.json();
+
+  const select = $('sel-years');
+  select.innerHTML = '';
+  years.forEach(y => {
+    const opt  = document.createElement('option');
+    opt.value  = y;
+    opt.text   = y;
+    select.appendChild(opt);
+  });
+
+  tsYears = new TomSelect('#sel-years', {
+    plugins: ['checkbox_options', 'remove_button'],
+    maxOptions: null,
+    placeholder: 'All years',
+  });
+
+  tsYears.setValue(years); // default: all years selected
+}
+
+async function loadUsers() {
+  const res   = await fetch('/api/users');
+  const users = await res.json();
+
+  const sel = $('sel-user');
+  users.forEach(u => {
+    const opt  = document.createElement('option');
+    opt.value  = u.id;
+    opt.text   = u.name;
+    sel.appendChild(opt);
+  });
+
+  // Default to user id=1
+  const vinz = users.find(u => u.id === 1);
+  if (vinz) sel.value = 1;
+}
+
+// ── Export helpers ────────────────────────────────────────────────────────
+function buildExportText() {
+  if (!currentData) return '(no data loaded yet)';
+  const d    = currentData;
+  const t    = d.totals;
+  const mode = d.metric_mode;
+  const isCyc = mode === 'cycling';
+
+  const sel   = $('sel-user');
+  const user  = sel.options[sel.selectedIndex]?.text || 'unknown';
+  const group = $('sel-group').value;
+  const groupLabel = { week: 'Weekly', month: 'Monthly', year: 'Yearly' }[group];
+  const types  = tsTypes ? tsTypes.getValue().join(', ') : '';
+  const years  = tsYears ? tsYears.getValue() : [];
+  const yRange = years.length > 1
+    ? `${years[years.length - 1]}–${years[0]}`
+    : (years[0] || 'all years');
+
+  const emoji    = isCyc ? '🚴' : '🏃';
+  const typeDisp = isCyc ? 'Cycling' : 'Running';
+  const tags     = isCyc ? '#cycling #sportsstats' : '#running #sportsstats';
+
+  // Top 5 periods by distance
+  const combined = d.periods.map((p, i) => ({ p, km: d.distance_km[i], n: d.activity_count[i] }));
+  combined.sort((a, b) => b.km - a.km);
+  const top5 = combined.slice(0, 5);
+
+  let lines = [
+    `${emoji} ${typeDisp} Stats · @${user}`,
+    `📅 ${groupLabel} | ${yRange}`,
+    `📏 Total distance: ${t.distance_km.toLocaleString('en', { maximumFractionDigits: 1 })} km`,
+    `🔢 Activities: ${t.activity_count}`,
+  ];
+
+  if (isCyc) {
+    lines.push(`💨 Avg speed: ${fmtSpeed(t.avg_speed_ms)} km/h`);
+    lines.push(`⚡ Best speed: ${fmtSpeed(t.best_speed_ms)} km/h`);
+    if (t.elevation_m > 0)
+      lines.push(`⛰️  Elevation: ${t.elevation_m.toLocaleString()} m`);
+  } else {
+    lines.push(`⏱️  Avg pace: ${fmtPace(t.avg_speed_ms)} /km`);
+    lines.push(`🚀 Best pace: ${fmtPace(t.best_speed_ms)} /km`);
+  }
+
+  lines.push('');
+  lines.push('Top periods by distance:');
+  top5.forEach(r => {
+    lines.push(`  • ${r.p}: ${r.km.toFixed(1)} km (${r.n})`);
+  });
+  lines.push('');
+  lines.push(tags);
+
+  return lines.join('\n');
+}
+
+// ── Social card canvas ────────────────────────────────────────────────────
+function drawSocialCard() {
+  if (!currentData) return;
+
+  const d      = currentData;
+  const t      = d.totals;
+  const mode   = d.metric_mode;
+  const isCyc  = mode === 'cycling';
+  const accent = ACCENT[mode] || ACCENT.running;
+
+  const sel    = $('sel-user');
+  const user   = sel.options[sel.selectedIndex]?.text || '?';
+  const group  = $('sel-group').value;
+  const glabel = { week: 'Weekly', month: 'Monthly', year: 'Yearly' }[group];
+  const years  = tsYears ? tsYears.getValue() : [];
+  const yRange = years.length > 1
+    ? `${years[years.length - 1]}–${years[0]}`
+    : (years[0] || 'All years');
+
+  const emoji    = isCyc ? '🚴' : '🏃';
+  const typeDisp = isCyc ? 'Cycling' : 'Running';
+  const tags     = isCyc ? '#cycling #sportsstats' : '#running #sportsstats';
+
+  const W = 1080, H = 1080;
+  const canvas = $('socialCanvas');
+  canvas.width  = W;
+  canvas.height = H;
+  const ctx = canvas.getContext('2d');
+
+  // Background gradient
+  const bg = ctx.createLinearGradient(0, 0, W, H);
+  bg.addColorStop(0, '#0f1117');
+  bg.addColorStop(1, '#1a1d27');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  // Top accent bar
+  ctx.fillStyle = accent;
+  ctx.fillRect(0, 0, W, 14);
+
+  // Helper: draw divider
+  const divider = y => {
+    ctx.strokeStyle = '#2d3148';
+    ctx.lineWidth   = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(60, y);
+    ctx.lineTo(W - 60, y);
+    ctx.stroke();
+  };
+
+  // Title
+  ctx.fillStyle  = '#FFFFFF';
+  ctx.font       = 'bold 54px system-ui, sans-serif';
+  ctx.textAlign  = 'center';
+  ctx.fillText(`${emoji}  ${typeDisp}`, W / 2, 110);
+
+  // Subtitle
+  ctx.fillStyle = '#94a3b8';
+  ctx.font      = '28px system-ui, sans-serif';
+  ctx.fillText(`@${user}  ·  ${glabel}  ·  ${yRange}`, W / 2, 160);
+
+  divider(195);
+
+  // Stats grid 2×2
+  const stats = isCyc
+    ? [
+        { label: 'Total Distance', value: `${t.distance_km.toLocaleString('en', { maximumFractionDigits: 1 })} km` },
+        { label: 'Activities',     value: String(t.activity_count) },
+        { label: 'Avg Speed',      value: `${fmtSpeed(t.avg_speed_ms)} km/h` },
+        { label: 'Best Speed',     value: `${fmtSpeed(t.best_speed_ms)} km/h` },
+      ]
+    : [
+        { label: 'Total Distance', value: `${t.distance_km.toLocaleString('en', { maximumFractionDigits: 1 })} km` },
+        { label: 'Activities',     value: String(t.activity_count) },
+        { label: 'Avg Pace',       value: `${fmtPace(t.avg_speed_ms)} /km` },
+        { label: 'Best Pace',      value: `${fmtPace(t.best_speed_ms)} /km` },
+      ];
+
+  stats.forEach((s, i) => {
+    const col  = i % 2;
+    const row  = Math.floor(i / 2);
+    const x    = col === 0 ? W / 4 : (3 * W) / 4;
+    const baseY = 250 + row * 190;
+
+    ctx.fillStyle  = '#94a3b8';
+    ctx.font       = '24px system-ui, sans-serif';
+    ctx.textAlign  = 'center';
+    ctx.fillText(s.label.toUpperCase(), x, baseY);
+
+    ctx.fillStyle = accent;
+    ctx.font      = 'bold 62px system-ui, sans-serif';
+    ctx.fillText(s.value, x, baseY + 76);
+  });
+
+  divider(640);
+
+  // Sparkline title
+  ctx.fillStyle  = '#94a3b8';
+  ctx.font       = '22px system-ui, sans-serif';
+  ctx.textAlign  = 'left';
+  ctx.fillText(`${glabel} distance (km) — last periods`, 60, 680);
+
+  // Sparkline bars
+  const SPARK_X = 60, SPARK_Y = 700, SPARK_W = W - 120, SPARK_H = 240;
+  const dist = d.distance_km;
+  const n    = Math.min(dist.length, 24);
+  const slice = dist.slice(-n);
+  const maxD  = Math.max(...slice.filter(v => v > 0), 1);
+  const barW  = Math.floor((SPARK_W / n) * 0.72);
+  const step  = SPARK_W / n;
+
+  slice.forEach((val, i) => {
+    const bh  = Math.max(4, (val / maxD) * SPARK_H);
+    const bx  = SPARK_X + i * step + (step - barW) / 2;
+    const by  = SPARK_Y + SPARK_H - bh;
+    const isLast = i === slice.length - 1;
+    ctx.fillStyle = isLast ? accent : accent + '88';
+    ctx.beginPath();
+    ctx.roundRect(bx, by, barW, bh, 3);
+    ctx.fill();
+  });
+
+  // Period labels below sparkline (every nth)
+  const step_lbl = Math.ceil(n / 8);
+  ctx.fillStyle = '#64748b';
+  ctx.font      = '18px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  d.periods.slice(-n).forEach((p, i) => {
+    if (i % step_lbl === 0) {
+      const bx = SPARK_X + i * step + step / 2;
+      ctx.fillText(p, bx, SPARK_Y + SPARK_H + 24);
+    }
+  });
+
+  divider(975);
+
+  // Footer / tags
+  ctx.fillStyle = '#64748b';
+  ctx.font      = '26px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(tags, W / 2, 1040);
+}
+
+// ── Event wiring ──────────────────────────────────────────────────────────
+$('btn-apply').addEventListener('click', applyFilters);
+
+$('sel-user').addEventListener('change', async () => {
+  const uid = $('sel-user').value;
+  await Promise.all([loadActivityTypes(uid), loadYears(uid)]);
+});
+
+$('btn-copy-text').addEventListener('click', () => {
+  navigator.clipboard.writeText($('export-text').value);
+  const confirm = $('copy-confirm');
+  confirm.style.display = 'inline';
+  setTimeout(() => { confirm.style.display = 'none'; }, 2000);
+});
+
+$('btn-download-img').addEventListener('click', () => {
+  const canvas = $('socialCanvas');
+  const link   = document.createElement('a');
+  link.download = 'sport-stats.png';
+  link.href     = canvas.toDataURL('image/png');
+  link.click();
+});
+
+// Populate export on modal open
+document.getElementById('exportModal').addEventListener('show.bs.modal', () => {
+  $('export-text').value = buildExportText();
+  drawSocialCard();
+});
+
+// ── Init ──────────────────────────────────────────────────────────────────
+(async () => {
+  await loadUsers();
+  const uid = $('sel-user').value;
+  if (uid) {
+    await Promise.all([loadActivityTypes(uid), loadYears(uid)]);
+    // Auto-apply defaults on load
+    await applyFilters();
+  }
+})();
+</script>
+</body>
+</html>
