@@ -1,10 +1,13 @@
 # Shell scripts
 *.sh
 
-# Strava data exports — contain personal GPS and health data
+# Data exports — contain personal GPS and health data
 Strava Dump */
 strava_dump*/
 strava_data/
+archive/
+dailymile_export/
+runmeter_data/
 
 # Databases
 *.db

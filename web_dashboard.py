@@ -13,9 +13,9 @@ from flask import Flask, abort, jsonify, render_template, request
 # ---------------------------------------------------------------------------
 DB_PATH = Path(os.environ.get("DB_PATH", Path.home() / "data" / "garminnostra" / "garmin_nostra.db"))
 
-# Keywords used to classify activity types into cycling vs. running
-CYCLING_KEYWORDS = ["rad", "bike", "cycl", "ride", "velo", "gravel"]
-RUNNING_KEYWORDS = ["run", "lauf", "jog"]
+# Normalized type names used to classify metric mode
+CYCLING_TYPES = {"cycling", "indoor_cycling", "mountain_biking", "gravel_cycling"}
+RUNNING_TYPES = {"running"}
 
 PERIOD_FORMATS = {
     "week": "%Y-W%W",
@@ -36,19 +36,10 @@ def get_db() -> sqlite3.Connection:
 
 
 def classify_metric_mode(types: list[str]) -> str:
-    """Return 'cycling', 'running', or 'mixed' based on selected activity types.
-
-    Rules
-    -----
-    - If **all** selected types are cycling-like  → 'cycling'
-      (shows velocity km/h + elevation chart)
-    - If **all** selected types are running-like  → 'running'
-      (shows pace min/km, no elevation chart)
-    - Otherwise                                   → 'mixed'
-      (shows pace min/km, no elevation chart)
-    """
-    has_cycling = any(any(k in t.lower() for k in CYCLING_KEYWORDS) for t in types)
-    has_running = any(any(k in t.lower() for k in RUNNING_KEYWORDS) for t in types)
+    """Return 'cycling', 'running', or 'mixed' based on selected normalized types."""
+    type_set = {t.lower() for t in types}
+    has_cycling = bool(type_set & CYCLING_TYPES)
+    has_running = bool(type_set & RUNNING_TYPES)
     if has_cycling and not has_running:
         return "cycling"
     if has_running and not has_cycling:
@@ -87,12 +78,16 @@ def api_activity_types():
         abort(400, "user_id required")
     with get_db() as db:
         rows = db.execute(
-            "SELECT activity_type, COUNT(*) AS cnt FROM activities "
-            "WHERE user_id = ? AND activity_type IS NOT NULL "
-            "GROUP BY activity_type ORDER BY activity_type",
+            "SELECT COALESCE(n.activity_type_normalized, a.activity_type) AS norm_type, "
+            "       COUNT(*) AS cnt "
+            "FROM activities a "
+            "LEFT JOIN activity_type_normalization n "
+            "  ON a.activity_type = n.activity_type_original "
+            "WHERE a.user_id = ? AND a.activity_type IS NOT NULL "
+            "GROUP BY norm_type ORDER BY norm_type",
             (user_id,),
         ).fetchall()
-    return jsonify([{"type": r["activity_type"], "count": r["cnt"]} for r in rows])
+    return jsonify([{"type": r["norm_type"], "count": r["cnt"]} for r in rows])
 
 
 @app.route("/api/years")
@@ -133,22 +128,27 @@ def api_data():
     year_clause = ""
     if years:
         year_ph = ",".join("?" * len(years))
-        year_clause = f"AND strftime('%Y', start_time_local) IN ({year_ph})"
+        year_clause = f"AND strftime('%Y', a.start_time_local) IN ({year_ph})"
         params.extend(years)
+
+    norm_join = ("LEFT JOIN activity_type_normalization n "
+                 "ON a.activity_type = n.activity_type_original")
+    norm_filter = f"COALESCE(n.activity_type_normalized, a.activity_type) IN ({type_ph})"
 
     sql = f"""
         SELECT
-            strftime('{fmt}', start_time_local)                         AS period,
-            SUM(distance_m) / 1000.0                                    AS distance_km,
-            AVG(CASE WHEN avg_speed_ms > 0.3 THEN avg_speed_ms END)    AS avg_speed_ms,
-            MAX(avg_speed_ms)                                            AS best_speed_ms,
-            SUM(CASE WHEN elevation_gain_m > 0 THEN elevation_gain_m
+            strftime('{fmt}', a.start_time_local)                       AS period,
+            SUM(a.distance_m) / 1000.0                                  AS distance_km,
+            AVG(CASE WHEN a.avg_speed_ms > 0.3 THEN a.avg_speed_ms END) AS avg_speed_ms,
+            MAX(a.avg_speed_ms)                                          AS best_speed_ms,
+            SUM(CASE WHEN a.elevation_gain_m > 0 THEN a.elevation_gain_m
                      ELSE 0 END)                                         AS elevation_m,
             COUNT(*)                                                     AS activity_count
-        FROM activities
-        WHERE user_id = ?
-          AND activity_type IN ({type_ph})
-          AND distance_m > 0
+        FROM activities a
+        {norm_join}
+        WHERE a.user_id = ?
+          AND {norm_filter}
+          AND a.distance_m > 0
           {year_clause}
         GROUP BY period
         ORDER BY period
@@ -157,10 +157,11 @@ def api_data():
     with get_db() as db:
         rows = db.execute(sql, params).fetchall()
         r = db.execute(
-            f"SELECT activity_name, start_time_local, avg_speed_ms "
-            f"FROM activities WHERE user_id=? AND activity_type IN ({type_ph}) "
-            f"AND distance_m>0 AND avg_speed_ms>0.3 {year_clause} "
-            f"ORDER BY avg_speed_ms DESC LIMIT 1",
+            f"SELECT a.activity_name, a.start_time_local, a.avg_speed_ms "
+            f"FROM activities a {norm_join} "
+            f"WHERE a.user_id=? AND {norm_filter} "
+            f"AND a.distance_m>0 AND a.avg_speed_ms>0.3 {year_clause} "
+            f"ORDER BY a.avg_speed_ms DESC LIMIT 1",
             params,
         ).fetchone()
         fastest = (
@@ -170,10 +171,11 @@ def api_data():
             if r else None
         )
         r = db.execute(
-            f"SELECT activity_name, start_time_local, distance_m "
-            f"FROM activities WHERE user_id=? AND activity_type IN ({type_ph}) "
-            f"AND distance_m>0 {year_clause} "
-            f"ORDER BY distance_m DESC LIMIT 1",
+            f"SELECT a.activity_name, a.start_time_local, a.distance_m "
+            f"FROM activities a {norm_join} "
+            f"WHERE a.user_id=? AND {norm_filter} "
+            f"AND a.distance_m>0 {year_clause} "
+            f"ORDER BY a.distance_m DESC LIMIT 1",
             params,
         ).fetchone()
         longest = (
@@ -192,19 +194,21 @@ def api_data():
             }
         top5_fastest = [
             _row_to_dict(r) for r in db.execute(
-                f"SELECT activity_name, start_time_local, distance_m, avg_speed_ms, duration_s "
-                f"FROM activities WHERE user_id=? AND activity_type IN ({type_ph}) "
-                f"AND distance_m>0 AND avg_speed_ms>0.3 {year_clause} "
-                f"ORDER BY avg_speed_ms DESC LIMIT 5",
+                f"SELECT a.activity_name, a.start_time_local, a.distance_m, a.avg_speed_ms, a.duration_s "
+                f"FROM activities a {norm_join} "
+                f"WHERE a.user_id=? AND {norm_filter} "
+                f"AND a.distance_m>0 AND a.avg_speed_ms>0.3 {year_clause} "
+                f"ORDER BY a.avg_speed_ms DESC LIMIT 5",
                 params,
             ).fetchall()
         ]
         top5_longest = [
             _row_to_dict(r) for r in db.execute(
-                f"SELECT activity_name, start_time_local, distance_m, avg_speed_ms, duration_s "
-                f"FROM activities WHERE user_id=? AND activity_type IN ({type_ph}) "
-                f"AND distance_m>0 {year_clause} "
-                f"ORDER BY distance_m DESC LIMIT 5",
+                f"SELECT a.activity_name, a.start_time_local, a.distance_m, a.avg_speed_ms, a.duration_s "
+                f"FROM activities a {norm_join} "
+                f"WHERE a.user_id=? AND {norm_filter} "
+                f"AND a.distance_m>0 {year_clause} "
+                f"ORDER BY a.distance_m DESC LIMIT 5",
                 params,
             ).fetchall()
         ]
@@ -255,4 +259,5 @@ def api_data():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    app.run(debug=os.environ.get("FLASK_DEBUG", "").lower() in ("1", "true"),
+            host="0.0.0.0", port=5000)

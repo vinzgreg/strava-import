@@ -272,8 +272,9 @@
 <script>
 // ── Constants ────────────────────────────────────────────────────────────
 const ACCENT = { running: '#FF6B35', cycling: '#00B4D8', mixed: '#A855F7' };
-const RUN_KW  = ['run', 'lauf', 'jog'];
-const CYC_KW  = ['rad', 'bike', 'cycl', 'ride', 'velo', 'gravel'];
+const RUN_TYPES = ['running'];
+const CYC_TYPES = ['cycling', 'indoor_cycling', 'gravel_cycling'];
+const MTB_TYPES = ['mountain_biking'];
 
 // ── State ────────────────────────────────────────────────────────────────
 let tsTypes = null;
@@ -310,10 +311,10 @@ function setAccent(mode) {
 }
 
 function isDefaultRunType(t) {
-  return RUN_KW.some(k => t.toLowerCase().includes(k));
+  return RUN_TYPES.includes(t.toLowerCase());
 }
 function isCycType(t) {
-  return CYC_KW.some(k => t.toLowerCase().includes(k));
+  return CYC_TYPES.includes(t.toLowerCase()) || MTB_TYPES.includes(t.toLowerCase());
 }
 
 function destroyChart(key) {
@@ -509,25 +510,18 @@ function buildElevChart(data) {
 }
 
 // ── Quick filter presets ──────────────────────────────────────────────────
-const MTB_KW = ['mtb', 'mountain'];
-
 function quickFilter(preset) {
   if (!tsTypes) return;
   const all = Object.keys(tsTypes.options);
   let matched;
   if (preset === 'running') {
-    matched = all.filter(t => RUN_KW.some(k => t.toLowerCase().includes(k)));
+    matched = all.filter(t => RUN_TYPES.includes(t.toLowerCase()));
   } else if (preset === 'bike') {
-    matched = all.filter(t =>
-      CYC_KW.some(k => t.toLowerCase().includes(k)) &&
-      !MTB_KW.some(k => t.toLowerCase().includes(k))
-    );
-    // fallback: include all cycling if no non-MTB cycling found
-    if (!matched.length) matched = all.filter(t => CYC_KW.some(k => t.toLowerCase().includes(k)));
+    matched = all.filter(t => CYC_TYPES.includes(t.toLowerCase()));
+    if (!matched.length) matched = all.filter(t => isCycType(t));
   } else if (preset === 'mtb') {
-    matched = all.filter(t => MTB_KW.some(k => t.toLowerCase().includes(k)));
-    // fallback: cycling keywords
-    if (!matched.length) matched = all.filter(t => CYC_KW.some(k => t.toLowerCase().includes(k)));
+    matched = all.filter(t => MTB_TYPES.includes(t.toLowerCase()));
+    if (!matched.length) matched = all.filter(t => isCycType(t));
   }
   if (matched && matched.length) {
     tsTypes.setValue(matched);
@@ -608,6 +602,8 @@ function updateTop5(data) {
   $('top5-fast-col').textContent   = colLabel;
   $('top5-long-col').textContent   = colLabel;
 
+  function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
   function fillTable(tbodyId, rows) {
     const tbody = $(tbodyId);
     tbody.innerHTML = '';
@@ -618,8 +614,8 @@ function updateTop5(data) {
       const tr = document.createElement('tr');
       tr.innerHTML = `
         <td style="color:${accent};font-weight:700;">${i + 1}</td>
-        <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${r.name}">${r.name}</td>
-        <td style="white-space:nowrap;">${r.date}</td>
+        <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(r.name)}">${esc(r.name)}</td>
+        <td style="white-space:nowrap;">${esc(r.date)}</td>
         <td style="white-space:nowrap;">${r.distance_km.toLocaleString('de-DE',{maximumFractionDigits:1})} km</td>
         <td style="white-space:nowrap;">${pace}</td>`;
       tbody.appendChild(tr);
