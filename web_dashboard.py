@@ -149,6 +149,7 @@ def api_data():
         WHERE a.user_id = ?
           AND {norm_filter}
           AND a.distance_m > 0
+          AND a.suppressed IS NULL
           {year_clause}
         GROUP BY period
         ORDER BY period
@@ -160,7 +161,7 @@ def api_data():
             f"SELECT a.activity_name, a.start_time_local, a.avg_speed_ms "
             f"FROM activities a {norm_join} "
             f"WHERE a.user_id=? AND {norm_filter} "
-            f"AND a.distance_m>0 AND a.avg_speed_ms>0.3 {year_clause} "
+            f"AND a.distance_m>0 AND a.avg_speed_ms>0.3 AND a.suppressed IS NULL {year_clause} "
             f"ORDER BY a.avg_speed_ms DESC LIMIT 1",
             params,
         ).fetchone()
@@ -174,7 +175,7 @@ def api_data():
             f"SELECT a.activity_name, a.start_time_local, a.distance_m "
             f"FROM activities a {norm_join} "
             f"WHERE a.user_id=? AND {norm_filter} "
-            f"AND a.distance_m>0 {year_clause} "
+            f"AND a.distance_m>0 AND a.suppressed IS NULL {year_clause} "
             f"ORDER BY a.distance_m DESC LIMIT 1",
             params,
         ).fetchone()
@@ -197,7 +198,7 @@ def api_data():
                 f"SELECT a.activity_name, a.start_time_local, a.distance_m, a.avg_speed_ms, a.duration_s "
                 f"FROM activities a {norm_join} "
                 f"WHERE a.user_id=? AND {norm_filter} "
-                f"AND a.distance_m>0 AND a.avg_speed_ms>0.3 {year_clause} "
+                f"AND a.distance_m>0 AND a.avg_speed_ms>0.3 AND a.suppressed IS NULL {year_clause} "
                 f"ORDER BY a.avg_speed_ms DESC LIMIT 5",
                 params,
             ).fetchall()
@@ -207,7 +208,7 @@ def api_data():
                 f"SELECT a.activity_name, a.start_time_local, a.distance_m, a.avg_speed_ms, a.duration_s "
                 f"FROM activities a {norm_join} "
                 f"WHERE a.user_id=? AND {norm_filter} "
-                f"AND a.distance_m>0 {year_clause} "
+                f"AND a.distance_m>0 AND a.suppressed IS NULL {year_clause} "
                 f"ORDER BY a.distance_m DESC LIMIT 5",
                 params,
             ).fetchall()
