@@ -984,7 +984,16 @@ $('sel-user').addEventListener('change', async () => {
 });
 
 $('btn-copy-text').addEventListener('click', () => {
-  navigator.clipboard.writeText($('export-text').value);
+  const ta = $('export-text');
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(ta.value).catch(() => {
+      ta.select();
+      document.execCommand('copy');
+    });
+  } else {
+    ta.select();
+    document.execCommand('copy');
+  }
   const confirm = $('copy-confirm');
   confirm.style.display = 'inline';
   setTimeout(() => { confirm.style.display = 'none'; }, 2000);
