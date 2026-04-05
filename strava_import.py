@@ -2431,6 +2431,18 @@ def _iter_garmin_archive_fits(export_dir: Path):
                     yield zip_path.name, name, fh.read()
 
 
+def _db_path_for(written_path: Path, dest: Path, dest_db: Path | None) -> str:
+    """Return the path to store in the DB for a written file.
+
+    If *dest_db* is given, replace the *dest* prefix with *dest_db* so that
+    the DB stores the path as seen by the consuming application (e.g. a Docker
+    container) rather than the host write path.
+    """
+    if dest_db is None:
+        return str(written_path)
+    return str(dest_db / written_path.relative_to(dest))
+
+
 def import_garminarchive_activities(
     export_dir: Path,
     db_path: Path,
@@ -2440,6 +2452,7 @@ def import_garminarchive_activities(
     dry_run: bool,
     init_db: bool,
     fit_dest: Path | None,
+    fit_dest_db: Path | None,
 ) -> None:
     """Import activities from a Garmin data export (zip archives of FIT files).
 
@@ -2582,7 +2595,7 @@ def import_garminarchive_activities(
                 if fit_dest_path and not fit_dest_path.exists():
                     with open(fit_dest_path, "wb") as fh:
                         fh.write(fit_bytes)
-                stored_path = str(fit_dest_path) if fit_dest_path else None
+                stored_path = _db_path_for(fit_dest_path, fit_dest, fit_dest_db) if fit_dest_path else None
                 if stored_path:
                     conn.execute(
                         "UPDATE activities SET fit_path = ? WHERE id = ? AND (fit_path IS NULL OR fit_path = '')",
@@ -2620,7 +2633,7 @@ def import_garminarchive_activities(
                     if fit_dest_path and not fit_dest_path.exists():
                         with open(fit_dest_path, "wb") as fh:
                             fh.write(fit_bytes)
-                    stored_path = str(fit_dest_path) if fit_dest_path else None
+                    stored_path = _db_path_for(fit_dest_path, fit_dest, fit_dest_db) if fit_dest_path else None
                     if stored_path:
                         conn.execute(
                             "UPDATE activities SET fit_path = ? WHERE id = ? AND (fit_path IS NULL OR fit_path = '')",
@@ -2661,7 +2674,7 @@ def import_garminarchive_activities(
             if not fit_dest_path.exists():
                 with open(fit_dest_path, "wb") as fh:
                     fh.write(fit_bytes)
-            fit_path_stored = str(fit_dest_path)
+            fit_path_stored = _db_path_for(fit_dest_path, fit_dest, fit_dest_db)
 
         try:
             conn.execute(
@@ -2781,6 +2794,9 @@ Examples:
   # Import Garmin data export (unzipped)
   python strava_import.py --garmin-archive ~/Downloads/20260405garmin_export --db garmin.db --fit-dest data/fit --dry-run
   python strava_import.py --garmin-archive ~/Downloads/20260405garmin_export --db garmin.db --fit-dest data/fit --backup
+  # Docker: write to host path, store container path in DB
+  python strava_import.py --garmin-archive ~/Downloads/20260405garmin_export --db garmin.db \
+    --fit-dest ~/data/garminnostra/fit --fit-dest-db /data/fit --backup
 """,
     )
     source_group = parser.add_mutually_exclusive_group(required=True)
@@ -2821,8 +2837,26 @@ Examples:
         help="Destination directory for GPX files. If omitted, GPX files are not copied.",
     )
     parser.add_argument(
+        "--gpx-dest-db", metavar="DIR", default=None,
+        help=(
+            "Path prefix stored in the DB for GPX files. "
+            "Use when the host write path (--gpx-dest) differs from the path the "
+            "application sees, e.g. inside a Docker container. "
+            "Example: --gpx-dest ~/data/garminnostra/gpx --gpx-dest-db /data/gpx"
+        ),
+    )
+    parser.add_argument(
         "--fit-dest", metavar="DIR", default=None,
         help="Destination directory for FIT/FIT.GZ files. If omitted, FIT files are not copied.",
+    )
+    parser.add_argument(
+        "--fit-dest-db", metavar="DIR", default=None,
+        help=(
+            "Path prefix stored in the DB for FIT files. "
+            "Use when the host write path (--fit-dest) differs from the path the "
+            "application sees, e.g. inside a Docker container. "
+            "Example: --fit-dest ~/data/garminnostra/fit --fit-dest-db /data/fit"
+        ),
     )
     parser.add_argument(
         "--start-date", metavar="DATE", type=parse_date, default=None,
@@ -2884,11 +2918,13 @@ Examples:
         export_dir = Path(args.garmin_archive)
         if not export_dir.is_dir():
             sys.exit(f"ERROR: Garmin export directory not found: {export_dir}")
-        fit_dest = Path(args.fit_dest) if args.fit_dest else None
+        fit_dest    = Path(args.fit_dest).expanduser()    if args.fit_dest    else None
+        fit_dest_db = Path(args.fit_dest_db).expanduser() if args.fit_dest_db else None
         print(f"Garmin archive import")
         print(f"  dir          : {export_dir}")
         print(f"  db           : {db_path}")
         print(f"  fit-dest     : {fit_dest or '(not copying)'}")
+        print(f"  fit-dest-db  : {fit_dest_db or fit_dest or '(same as fit-dest)'}")
         print(f"  dates        : {args.start_date or 'any'} → {args.end_date or 'any'}")
         print(f"  user_id      : {args.user_id}")
         print(f"  dry-run      : {args.dry_run}")
@@ -2903,6 +2939,7 @@ Examples:
             dry_run=args.dry_run,
             init_db=args.init_db,
             fit_dest=fit_dest,
+            fit_dest_db=fit_dest_db,
         )
     elif args.applehealth:
         export_dir = Path(args.applehealth)
