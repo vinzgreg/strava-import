@@ -24,11 +24,17 @@ specified per run.
 | `--cyclemeter FILE` | **Cyclemeter** CSV | Semicolon-separated CSV (one row per activity, full timestamp) |
 | `--dailymile DIR` | **DailyMile** export | Folder containing `dailymile_export.csv` + per-activity JSON files |
 | `--applehealth DIR` | **Apple Health** export | Extracted `Export.zip` folder containing `Export.xml` |
+| `--garmin-archive DIR` | **Garmin** data export | Extracted Garmin account export containing upload zip archives |
 
 ### Requirements
 
-Python 3.10 or newer. No third-party packages — standard library only.
-`zoneinfo` (stdlib ≥ 3.9) is used for UTC → Europe/Berlin conversion in the DailyMile importer.
+Python 3.10 or newer.  
+`zoneinfo` (stdlib ≥ 3.9) is used for UTC → Europe/Berlin conversion.  
+`fitdecode>=0.10` is required for the `--garmin-archive` mode only:
+
+```bash
+pip install fitdecode>=0.10
+```
 
 ---
 
@@ -54,7 +60,9 @@ python3 strava_import.py --dump DIR --db FILE [OPTIONS]
 | `--dump DIR` | *(required)* | Path to the Strava export folder. |
 | `--db FILE` | *(required)* | SQLite database file. |
 | `--gpx-dest DIR` | *(not set)* | Directory to copy GPX files into. |
+| `--gpx-dest-db DIR` | *(same as --gpx-dest)* | Path prefix stored in the DB for GPX files (use when the app runs in Docker and sees a different path than the host). |
 | `--fit-dest DIR` | *(not set)* | Directory to copy FIT/FIT.GZ files into. |
+| `--fit-dest-db DIR` | *(same as --fit-dest)* | Path prefix stored in the DB for FIT files (use when the app runs in Docker and sees a different path than the host). |
 | `--start-date DATE` | *(none)* | Only import activities on or after this date (`YYYY-MM-DD` or `DD.MM.YYYY`). |
 | `--end-date DATE` | *(none)* | Only import activities on or before this date. Same formats. |
 | `--user-id N` | `1` | `user_id` assigned to every imported row. |
@@ -373,6 +381,94 @@ python3 strava_import.py \
 
 ---
 
+### Mode: Garmin archive (`--garmin-archive`)
+
+Imports activities from a **Garmin account data export**. Request your export
+from Garmin Connect → Account → Data Management → Export Your Data. Extract the
+resulting zip and pass the root folder to this mode.
+
+The importer reads FIT files directly from the upload zip archives inside the
+export (no manual extraction needed) and parses each file's session metrics
+using `fitdecode`.
+
+**Requires:** `pip install fitdecode>=0.10`
+
+#### Usage
+
+```bash
+python3 strava_import.py --garmin-archive DIR --db FILE [OPTIONS]
+```
+
+#### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `--garmin-archive DIR` | *(required)* | Path to the extracted Garmin export root folder. |
+| `--db FILE` | *(required)* | SQLite database file. |
+| `--fit-dest DIR` | *(not set)* | Host directory to copy FIT files into. |
+| `--fit-dest-db DIR` | *(same as --fit-dest)* | Container-internal path prefix stored in the DB (Docker setups). |
+| `--start-date DATE` | *(none)* | Only import activities on or after this date. |
+| `--end-date DATE` | *(none)* | Only import activities on or before this date. |
+| `--user-id N` | `1` | `user_id` assigned to every imported row. |
+| `--init-db` | *(off)* | Create tables if missing. |
+| `--dry-run` | *(off)* | Simulate without touching the DB. |
+| `--backup` | *(off)* | Write a timestamped DB backup before any changes. |
+
+#### Matching logic
+
+For each FIT file the importer tries to match an existing DB activity in order:
+
+1. **±60 s timestamp match** — same activity already in DB (e.g. from garmin-nostra sync): update `fit_path` only if missing, nothing else is touched.
+2. **±2 h + distance ±5 % match** — same real-world event from another source: update `fit_path` if missing, otherwise skip.
+3. **No match** — insert a new row with `source = 'GarminArchive'`.
+
+Non-activity FIT files in the export (segment lists, monitoring data, courses)
+have no session message and are silently skipped.
+
+#### Field mapping
+
+| DB column | Source |
+|---|---|
+| `garmin_activity_id` | `"garminarchive_<UTC_timestamp>"` (synthetic) |
+| `activity_name` | `"<type> <date>"` e.g. `"Lauf 2024-06-15"` |
+| `activity_type` / `sport_type` | Mapped from FIT `sport` + `sub_sport` fields |
+| `source` | Always `'GarminArchive'` |
+| `start_time_utc` | FIT session `start_time` (UTC) |
+| `start_time_local` | `start_time` converted to Europe/Berlin |
+| `elapsed_time_s` / `duration_s` | `total_elapsed_time` |
+| `moving_time_s` | `total_timer_time` |
+| `distance_m` | `total_distance` |
+| `elevation_gain_m` / `elevation_loss_m` | `total_ascent` / `total_descent` |
+| `avg_speed_ms` / `max_speed_ms` | `avg_speed` / `max_speed` |
+| `avg_hr` / `max_hr` | `avg_heart_rate` / `max_heart_rate` |
+| `avg_cadence` / `max_cadence` | `avg_cadence` / `max_cadence` |
+| `avg_power_w` / `max_power_w` / `normalized_power_w` | `avg_power` / `max_power` / `normalized_power` |
+| `calories` | `total_calories` |
+| `start_lat` / `start_lon` | `start_position_lat/long` (converted from semicircles) |
+| `fit_path` | Container path of the copied FIT file |
+
+#### Examples
+
+```bash
+# Dry-run preview
+python3 strava_import.py \
+    --garmin-archive ~/Downloads/20260405garmin_export \
+    --db ~/data/garminnostra/garmin_nostra.db \
+    --fit-dest ~/data/garminnostra/fit \
+    --fit-dest-db /data/fit \
+    --dry-run
+
+# Full import with backup (Docker path mapping)
+python3 strava_import.py \
+    --garmin-archive ~/Downloads/20260405garmin_export \
+    --db ~/data/garminnostra/garmin_nostra.db \
+    --fit-dest ~/data/garminnostra/fit \
+    --fit-dest-db /data/fit \
+    --backup
+```
+
+---
+
 ### Cross-source duplicate detection
 
 All importers share the same duplicate detection logic. Before inserting an
@@ -386,6 +482,50 @@ activity, the script checks the existing DB for a match:
 
 This prevents double-importing activities that were already captured from a
 different source (e.g. Garmin, Strava, Runmeter).
+
+---
+
+### Utility scripts
+
+#### `fix_paths.py` — normalise host paths to container paths
+
+Rewrites `fit_path` and `gpx_path` values that point to host paths
+(`/home/vinz/data/garminnostra/…`) to container-internal paths (`/data/…`).
+Run this once after switching to a Docker setup or after an import that wrote
+host paths.
+
+```bash
+python3 fix_paths.py --db ~/data/garminnostra/garmin_nostra.db --dry-run
+python3 fix_paths.py --db ~/data/garminnostra/garmin_nostra.db
+```
+
+Files not found on the host are reported and left unchanged.
+
+#### `fix_strava_paths.py` — move Strava dump files to the data store
+
+Finds activities whose `fit_path` or `gpx_path` still points into the Strava
+dump folder (`~/bin/sport_import/strava-import/strava_data/`), copies each
+file to the correct destination directory, and rewrites the DB path to the
+container-internal path.
+
+All four destination arguments are required (no defaults — paths are installation-specific):
+
+```bash
+python3 fix_strava_paths.py \
+    --db ~/data/garminnostra/garmin_nostra.db \
+    --fit-dest ~/data/garminnostra/fit/vinz \
+    --fit-dest-db /data/fit/vinz \
+    --gpx-dest ~/data/garminnostra/gpx/vinz \
+    --gpx-dest-db /data/gpx/vinz \
+    --dry-run
+
+python3 fix_strava_paths.py \
+    --db ~/data/garminnostra/garmin_nostra.db \
+    --fit-dest ~/data/garminnostra/fit/vinz \
+    --fit-dest-db /data/fit/vinz \
+    --gpx-dest ~/data/garminnostra/gpx/vinz \
+    --gpx-dest-db /data/gpx/vinz
+```
 
 ---
 
