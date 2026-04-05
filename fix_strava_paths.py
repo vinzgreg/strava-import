@@ -66,10 +66,13 @@ def main() -> None:
     }
 
     for col, (dest_host, dest_db) in columns.items():
-        container_prefix = str(dest_db)
+        # Use the parent of dest_db as the "already a container path" marker so
+        # that paths belonging to other users (e.g. /data/fit/Lucie/) are not
+        # mistakenly treated as broken host paths.
+        container_root = str(dest_db.parent)
         rows = conn.execute(
             f"SELECT id, {col} FROM activities WHERE {col} IS NOT NULL AND {col} NOT LIKE ?",
-            (container_prefix + "/%",),
+            (container_root + "/%",),
         ).fetchall()
 
         if not rows:
