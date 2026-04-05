@@ -93,9 +93,16 @@ def main() -> None:
                 pointer_fixed += 1
                 continue
 
-            # 2. File found in strava_data folder (if provided)
-            src = (strava_data / filename) if strava_data else None
-            if src and src.exists():
+            # 2. Try the path already recorded in the DB, then the strava_data folder
+            original = Path(row[col])
+            src = None
+            if original.exists():
+                src = original
+            elif strava_data:
+                candidate = strava_data / filename
+                if candidate.exists():
+                    src = candidate
+            if src:
                 if not args.dry_run:
                     dest_host.mkdir(parents=True, exist_ok=True)
                     try:
