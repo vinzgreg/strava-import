@@ -13,6 +13,7 @@ import json
 import shutil
 import sqlite3
 import sys
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -2284,6 +2285,458 @@ def import_dailymile_activities(
 
 
 # ---------------------------------------------------------------------------
+# Garmin archive import
+# ---------------------------------------------------------------------------
+
+# Garmin FIT sport value → German activity_type (same convention as other importers)
+_GARMIN_SPORT_TYPE_MAP: dict[str, str] = {
+    "running":           "Lauf",
+    "cycling":           "Fahrrad",
+    "swimming":          "Schwimmen",
+    "walking":           "Walk",
+    "hiking":            "Wandern",
+    "fitness_equipment": "Kraft",
+    "training":          "Fitness",
+    "multisport":        "Triathlon",
+    "rowing":            "Rudern",
+    "skiing":            "Ski",
+    "snowboarding":      "Snowboard",
+    "paddling":          "Paddeln",
+    "stand_up_paddleboarding": "SUP",
+    "yoga":              "Yoga",
+    "soccer":            "Fußball",
+    "tennis":            "Tennis",
+    "basketball":        "Basketball",
+    "generic":           "Sport",
+    "transition":        "Transition",
+    "e_biking":          "E-Bike",
+    "motorcycling":      "Motorrad",
+}
+
+# FIT sub_sport overrides where the sub is more informative than the sport
+_GARMIN_SUBSPORT_OVERRIDE: dict[str, str] = {
+    "indoor_cycling":   "Fahrrad (Indoor)",
+    "spin":             "Fahrrad (Indoor)",
+    "indoor_running":   "Lauf (Indoor)",
+    "treadmill":        "Lauf (Indoor)",
+    "trail":            "Trail",
+    "track":            "Lauf",
+    "open_water":       "Freiwasserschwimmen",
+    "lap_swimming":     "Schwimmen",
+    "cross_country_skiing": "Langlauf",
+    "downhill":         "Ski (Abfahrt)",
+    "strength_training": "Kraft",
+    "cardio_training":  "Fitness",
+    "yoga":             "Yoga",
+    "pilates":          "Pilates",
+    "hiit":             "HIIT",
+}
+
+# Zips inside a Garmin export that contain per-activity FIT files
+_GARMIN_UPLOAD_ZIPS = [
+    "DI_CONNECT/DI-Connect-Uploaded-Files/UploadedFiles_0-_Part1.zip",
+    "DI_CONNECT/DI-Connect-Uploaded-Files/UploadedFiles_0-_Part2.zip",
+]
+
+# Semicircle → degrees conversion factor
+_SEMICIRCLES_TO_DEG = 180.0 / (2 ** 31)
+
+
+def _parse_fit_session(fit_bytes: bytes) -> dict | None:
+    """Extract summary metrics from a FIT activity file.
+
+    Returns a dict of metrics or None if the file has no usable session.
+    Requires the fitdecode library (pip install fitdecode>=0.10).
+    """
+    try:
+        import fitdecode
+    except ImportError:
+        sys.exit("ERROR: fitdecode is not installed — run: pip install fitdecode>=0.10")
+
+    session: dict | None = None
+    start_lat = start_lon = None
+
+    try:
+        with fitdecode.FitReader(fit_bytes) as fit:
+            for frame in fit:
+                if not isinstance(frame, fitdecode.FitDataMessage):
+                    continue
+
+                if frame.name == "session":
+                    def _fv(field: str):
+                        return frame.get_value(field) if frame.has_field(field) else None
+
+                    t = _fv("start_time")
+                    if not isinstance(t, datetime):
+                        continue
+                    if t.tzinfo is None:
+                        t = t.replace(tzinfo=timezone.utc)
+                    start_utc = t.astimezone(timezone.utc)
+
+                    sport    = str(_fv("sport")    or "").lower().replace(" ", "_")
+                    subsport = str(_fv("sub_sport") or "").lower().replace(" ", "_")
+
+                    activity_type = (
+                        _GARMIN_SUBSPORT_OVERRIDE.get(subsport)
+                        or _GARMIN_SPORT_TYPE_MAP.get(sport)
+                        or sport.capitalize()
+                        or "Sport"
+                    )
+
+                    lat_raw = _fv("start_position_lat")
+                    lon_raw = _fv("start_position_long")
+
+                    session = {
+                        "start_utc":    start_utc,
+                        "sport":        sport,
+                        "subsport":     subsport,
+                        "activity_type": activity_type,
+                        "distance_m":   _fv("total_distance"),
+                        "elapsed_s":    _fv("total_elapsed_time"),
+                        "moving_s":     _fv("total_timer_time"),
+                        "avg_speed_ms": _fv("avg_speed"),
+                        "max_speed_ms": _fv("max_speed"),
+                        "avg_hr":       _fv("avg_heart_rate"),
+                        "max_hr":       _fv("max_heart_rate"),
+                        "elev_gain_m":  _fv("total_ascent"),
+                        "elev_loss_m":  _fv("total_descent"),
+                        "avg_cadence":  _fv("avg_cadence"),
+                        "max_cadence":  _fv("max_cadence"),
+                        "avg_power_w":  _fv("avg_power"),
+                        "max_power_w":  _fv("max_power"),
+                        "norm_power_w": _fv("normalized_power"),
+                        "calories":     _fv("total_calories"),
+                        "start_lat":    lat_raw * _SEMICIRCLES_TO_DEG if lat_raw is not None else None,
+                        "start_lon":    lon_raw * _SEMICIRCLES_TO_DEG if lon_raw is not None else None,
+                    }
+                    break  # first session message is sufficient
+    except Exception:
+        return None
+
+    return session
+
+
+def _iter_garmin_archive_fits(export_dir: Path):
+    """Yield (zip_name, member_name, fit_bytes) for every .fit in the upload zips."""
+    for rel in _GARMIN_UPLOAD_ZIPS:
+        zip_path = export_dir / rel
+        if not zip_path.exists():
+            print(f"  WARNING: zip not found, skipping: {zip_path}")
+            continue
+        with zipfile.ZipFile(zip_path) as zf:
+            entries = [n for n in zf.namelist() if n.lower().endswith(".fit")]
+            print(f"  {zip_path.name}: {len(entries)} .fit files")
+            for name in entries:
+                with zf.open(name) as fh:
+                    yield zip_path.name, name, fh.read()
+
+
+def import_garminarchive_activities(
+    export_dir: Path,
+    db_path: Path,
+    start_date: datetime | None,
+    end_date: datetime | None,
+    user_id: int,
+    dry_run: bool,
+    init_db: bool,
+    fit_dest: Path | None,
+) -> None:
+    """Import activities from a Garmin data export (zip archives of FIT files).
+
+    For each FIT file:
+    - If a DB activity with the same start_time (±60 s) already exists and
+      has no fit_path: update fit_path only, never touch other fields.
+    - If a DB activity within ±2 h + distance ±5 % exists (cross-source match):
+      skip (already covered by another source).
+    - Otherwise: insert a new row with source "GarminArchive".
+    """
+    # --- DB connection ---
+    if dry_run:
+        if db_path.exists():
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            check_prerequisites(conn, user_id)
+        else:
+            if not init_db:
+                sys.exit(f"ERROR: database not found: {db_path}\nRun with --init-db to create it.")
+            conn = sqlite3.connect(":memory:")
+            init_schema(conn)
+            conn.execute("INSERT OR IGNORE INTO users (id, name) VALUES (?, 'default')", (user_id,))
+            conn.commit()
+    else:
+        if not db_path.exists() and not init_db:
+            sys.exit(f"ERROR: database not found: {db_path}\nRun with --init-db to create it.")
+        conn = sqlite3.connect(db_path)
+        if init_db:
+            init_schema(conn)
+            conn.execute("INSERT OR IGNORE INTO users (id, name) VALUES (?, 'default')", (user_id,))
+            conn.commit()
+        check_prerequisites(conn, user_id)
+        migrate_schema(conn)
+
+    conn.row_factory = sqlite3.Row
+
+    # Pre-load all activities for this user into memory for matching
+    existing_ids: set[str] = set()
+    existing_list: list[dict] = []
+    cross_claimed_ids: set[int] = set()
+    for r in conn.execute(
+        "SELECT id, garmin_activity_id, start_time_utc, start_time_local, distance_m, activity_name, fit_path "
+        "FROM activities WHERE user_id = ?",
+        (user_id,),
+    ):
+        existing_ids.add(r["garmin_activity_id"])
+        dt_utc = _parse_ts(r["start_time_utc"])
+        dt_local = _parse_ts(r["start_time_local"])
+        existing_list.append({
+            "id":                  r["id"],
+            "garmin_activity_id":  r["garmin_activity_id"],
+            "start_time_utc":      r["start_time_utc"],
+            "start_time_local":    r["start_time_local"],
+            "distance_m":          r["distance_m"],
+            "activity_name":       r["activity_name"],
+            "fit_path":            r["fit_path"],
+            "dt_utc":              dt_utc,
+            "dt_local":            dt_local,
+            "date_only":           False,
+        })
+
+    # Build a fast index: unix_timestamp (rounded to second) → existing row
+    ts_index: dict[int, dict] = {}
+    for ex in existing_list:
+        if ex["dt_utc"]:
+            ts_index[int(ex["dt_utc"].timestamp())] = ex
+
+    if fit_dest and not dry_run:
+        fit_dest.mkdir(parents=True, exist_ok=True)
+
+    synced_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    n_fit = n_new = n_fit_updated = n_cross_dup = n_skipped = 0
+    n_date_filtered = n_no_session = n_parse_error = 0
+
+    print("Scanning Garmin export archives…")
+
+    for zip_name, member_name, fit_bytes in _iter_garmin_archive_fits(export_dir):
+        n_fit += 1
+        session = _parse_fit_session(fit_bytes)
+        if session is None:
+            n_no_session += 1
+            continue
+
+        start_utc: datetime = session["start_utc"]
+
+        # --- date filter ---
+        if start_date and start_utc.replace(tzinfo=None) < start_date:
+            n_date_filtered += 1
+            continue
+        if end_date and start_utc.replace(tzinfo=None) > end_date:
+            n_date_filtered += 1
+            continue
+
+        # local time (Europe/Berlin)
+        if _BERLIN_TZ is not None:
+            local_dt = start_utc.astimezone(_BERLIN_TZ).replace(tzinfo=None)
+        else:
+            offset_h = 2 if 3 < start_utc.month < 10 else 1
+            local_dt = start_utc.replace(tzinfo=None) + timedelta(hours=offset_h)
+
+        start_utc_str   = start_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+        start_local_str = local_dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+        dist_m    = session["distance_m"]
+        elapsed_s = session["elapsed_s"]
+
+        # Skip activities with no meaningful distance and no duration (e.g. device tests)
+        if not dist_m and not elapsed_s:
+            n_no_session += 1
+            continue
+
+        # Synthetic ID for new inserts
+        garmin_activity_id = f"garminarchive_{start_utc.strftime('%Y%m%dT%H%M%SZ')}"
+
+        # --- tight timestamp match (±60 s): same-source activity already in DB ---
+        target_ts = int(start_utc.timestamp())
+        same_source_match: dict | None = None
+        for delta in range(61):
+            for offset in ([0] if delta == 0 else [delta, -delta]):
+                hit = ts_index.get(target_ts + offset)
+                if hit:
+                    same_source_match = hit
+                    break
+            if same_source_match:
+                break
+
+        if same_source_match:
+            # Activity already in DB. Update fit_path if missing — nothing else.
+            # Trust the DB value without checking the filesystem: the path may be a
+            # container-internal path that doesn't exist on the host running this script.
+            if same_source_match.get("fit_path"):
+                n_skipped += 1
+                continue
+
+            # Determine destination path
+            fit_filename = Path(member_name).name
+            fit_dest_path = (fit_dest / fit_filename) if fit_dest else None
+
+            if not dry_run:
+                if fit_dest_path and not fit_dest_path.exists():
+                    with open(fit_dest_path, "wb") as fh:
+                        fh.write(fit_bytes)
+                stored_path = str(fit_dest_path) if fit_dest_path else None
+                if stored_path:
+                    conn.execute(
+                        "UPDATE activities SET fit_path = ? WHERE id = ? AND (fit_path IS NULL OR fit_path = '')",
+                        (stored_path, same_source_match["id"]),
+                    )
+                    conn.commit()
+                    same_source_match["fit_path"] = stored_path
+
+            print(
+                f"  FIT-UPDATED  {same_source_match['activity_name']!r:45s} {start_utc_str}"
+                f"  id={same_source_match['garmin_activity_id']}"
+            )
+            n_fit_updated += 1
+            continue
+
+        # --- cross-source duplicate check (±2 h + distance ±5 %) ---
+        if dist_m:
+            cross_dup = _find_cross_source_duplicate(
+                existing_list, cross_claimed_ids,
+                start_local_str, dist_m,
+                date_only=False,
+                window_h=2.0,
+            )
+            if cross_dup is not None:
+                cross_claimed_ids.add(cross_dup["id"])
+                # Same real-world activity already in DB. Update fit_path if missing.
+                # Trust the DB value without filesystem check (paths may be container-internal).
+                if cross_dup.get("fit_path"):
+                    n_cross_dup += 1
+                    continue
+
+                fit_filename = Path(member_name).name
+                fit_dest_path = (fit_dest / fit_filename) if fit_dest else None
+                if not dry_run:
+                    if fit_dest_path and not fit_dest_path.exists():
+                        with open(fit_dest_path, "wb") as fh:
+                            fh.write(fit_bytes)
+                    stored_path = str(fit_dest_path) if fit_dest_path else None
+                    if stored_path:
+                        conn.execute(
+                            "UPDATE activities SET fit_path = ? WHERE id = ? AND (fit_path IS NULL OR fit_path = '')",
+                            (stored_path, cross_dup["id"]),
+                        )
+                        conn.commit()
+                        cross_dup["fit_path"] = stored_path
+                print(
+                    f"  FIT-UPDATED  {cross_dup['activity_name']!r:45s} {start_utc_str}"
+                    f"  id={cross_dup['garmin_activity_id']}"
+                )
+                n_fit_updated += 1
+                continue
+
+        # --- new activity ---
+        if garmin_activity_id in existing_ids:
+            # Timestamp collision between two archive activities (rare): skip
+            n_skipped += 1
+            continue
+
+        activity_type = session["activity_type"]
+        activity_name = f"{activity_type} {start_local_str[:10]}"
+
+        if dry_run:
+            print(
+                f"  NEW          {activity_name!r:45s} {start_utc_str}"
+                f"  {(dist_m or 0) / 1000:.1f} km  {activity_type}"
+            )
+            n_new += 1
+            existing_ids.add(garmin_activity_id)
+            continue
+
+        # Copy FIT file
+        fit_path_stored: str | None = None
+        if fit_dest:
+            fit_filename = Path(member_name).name
+            fit_dest_path = fit_dest / fit_filename
+            if not fit_dest_path.exists():
+                with open(fit_dest_path, "wb") as fh:
+                    fh.write(fit_bytes)
+            fit_path_stored = str(fit_dest_path)
+
+        try:
+            conn.execute(
+                """
+                INSERT INTO activities (
+                    user_id, garmin_activity_id,
+                    activity_name, activity_type, sport_type,
+                    start_time_utc, start_time_local,
+                    duration_s, elapsed_time_s, moving_time_s,
+                    distance_m,
+                    elevation_gain_m, elevation_loss_m,
+                    avg_speed_ms, max_speed_ms,
+                    avg_hr, max_hr,
+                    avg_power_w, max_power_w, normalized_power_w,
+                    avg_cadence, max_cadence,
+                    calories,
+                    start_lat, start_lon,
+                    fit_path, source, synced_at
+                ) VALUES (
+                    ?,?,  ?,?,?,  ?,?,  ?,?,?,  ?,  ?,?,  ?,?,  ?,?,  ?,?,?,  ?,?,  ?,  ?,?,  ?,?,?
+                )
+                """,
+                (
+                    user_id, garmin_activity_id,
+                    activity_name, activity_type, activity_type,
+                    start_utc_str, start_local_str,
+                    elapsed_s, elapsed_s, session["moving_s"],
+                    dist_m,
+                    session["elev_gain_m"], session["elev_loss_m"],
+                    session["avg_speed_ms"], session["max_speed_ms"],
+                    session["avg_hr"], session["max_hr"],
+                    session["avg_power_w"], session["max_power_w"], session["norm_power_w"],
+                    session["avg_cadence"], session["max_cadence"],
+                    session["calories"],
+                    session["start_lat"], session["start_lon"],
+                    fit_path_stored, "GarminArchive", synced_at,
+                ),
+            )
+            conn.commit()
+            existing_ids.add(garmin_activity_id)
+            # Add to existing_list so later FITs in the same run don't create duplicates
+            existing_list.append({
+                "id":               conn.execute("SELECT last_insert_rowid()").fetchone()[0],
+                "garmin_activity_id": garmin_activity_id,
+                "start_time_utc":   start_utc_str,
+                "start_time_local": start_local_str,
+                "distance_m":       dist_m,
+                "activity_name":    activity_name,
+                "fit_path":         fit_path_stored,
+                "dt_utc":           start_utc,
+                "dt_local":         local_dt,
+                "date_only":        False,
+            })
+            ts_index[target_ts] = existing_list[-1]
+            n_new += 1
+        except Exception as exc:
+            print(f"  ERROR insert {garmin_activity_id}: {exc}", file=sys.stderr)
+            n_parse_error += 1
+
+    conn.close()
+
+    if dry_run:
+        print("DRY-RUN — nothing was written.\n")
+    print(f"\nDone.")
+    print(f"  FIT files scanned     : {n_fit}")
+    print(f"  fit_path updated      : {n_fit_updated}  (existing activity, FIT path added)")
+    print(f"  Imported (new)        : {n_new}")
+    print(f"  Skipped (duplicate)   : {n_skipped}  (already in DB with fit_path)")
+    print(f"  Skipped (cross-source): {n_cross_dup}  (same time ±2h + distance in DB)")
+    print(f"  No session data       : {n_no_session}  (FIT had no parseable session)")
+    print(f"  Outside dates         : {n_date_filtered}  (filtered out)")
+    print(f"  Errors                : {n_parse_error}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -2324,6 +2777,10 @@ Examples:
   python strava_import.py --cyclemeter runmeter_data/Cyclemeter_Import.csv --db garmin.db --dry-run
   python strava_import.py --dailymile dailymile_export/dailymile_export_NTQtMjkwODM5 --db garmin.db --dry-run
   python strava_import.py --applehealth apple_health_export --db garmin.db --dry-run
+
+  # Import Garmin data export (unzipped)
+  python strava_import.py --garmin-archive ~/Downloads/20260405garmin_export --db garmin.db --fit-dest data/fit --dry-run
+  python strava_import.py --garmin-archive ~/Downloads/20260405garmin_export --db garmin.db --fit-dest data/fit --backup
 """,
     )
     source_group = parser.add_mutually_exclusive_group(required=True)
@@ -2346,6 +2803,14 @@ Examples:
     source_group.add_argument(
         "--applehealth", metavar="DIR",
         help="Path to an extracted Apple Health export folder (contains export.xml).",
+    )
+    source_group.add_argument(
+        "--garmin-archive", metavar="DIR",
+        help=(
+            "Path to an extracted Garmin data export folder "
+            "(contains DI_CONNECT/DI-Connect-Uploaded-Files/UploadedFiles_0-_Part*.zip). "
+            "Requires: pip install fitdecode>=0.10"
+        ),
     )
     parser.add_argument(
         "--db", required=True, metavar="FILE",
@@ -2415,7 +2880,31 @@ Examples:
         else:
             print("--backup: DB does not exist yet, skipping backup.\n")
 
-    if args.applehealth:
+    if args.garmin_archive:
+        export_dir = Path(args.garmin_archive)
+        if not export_dir.is_dir():
+            sys.exit(f"ERROR: Garmin export directory not found: {export_dir}")
+        fit_dest = Path(args.fit_dest) if args.fit_dest else None
+        print(f"Garmin archive import")
+        print(f"  dir          : {export_dir}")
+        print(f"  db           : {db_path}")
+        print(f"  fit-dest     : {fit_dest or '(not copying)'}")
+        print(f"  dates        : {args.start_date or 'any'} → {args.end_date or 'any'}")
+        print(f"  user_id      : {args.user_id}")
+        print(f"  dry-run      : {args.dry_run}")
+        print(f"  init-db      : {args.init_db}")
+        print()
+        import_garminarchive_activities(
+            export_dir=export_dir,
+            db_path=db_path,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            user_id=args.user_id,
+            dry_run=args.dry_run,
+            init_db=args.init_db,
+            fit_dest=fit_dest,
+        )
+    elif args.applehealth:
         export_dir = Path(args.applehealth)
         if not export_dir.is_dir():
             sys.exit(f"ERROR: Apple Health export directory not found: {export_dir}")
