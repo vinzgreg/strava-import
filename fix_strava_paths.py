@@ -1,20 +1,31 @@
 #!/usr/bin/env python3
-"""Fix DB references to Strava dump files that were never moved to the data store.
+"""Fix DB path references for Strava-imported FIT/GPX files.
 
-Finds activities whose fit_path or gpx_path still points into the Strava dump
-folder (~/bin/sport_import/strava-import/strava_data/), copies the file to the
-correct destination directory on the host, and rewrites the DB path to the
-container-internal path.
+For each activity with a fit_path or gpx_path that does not start with the
+container prefix, the script:
+  1. Checks if the file already exists at the destination on the host → fixes
+     the DB pointer only.
+  2. Looks for the file by name in --strava-data → copies it to the
+     destination and fixes the DB pointer.
+  3. Reports files it cannot locate.
 
 Usage:
-    python fix_strava_paths.py --db ~/data/garminnostra/garmin_nostra.db [--dry-run]
+    python fix_strava_paths.py \\
+        --db        PATH \\
+        --strava-data PATH \\
+        --fit-dest  DIR  --fit-dest-db  DIR \\
+        --gpx-dest  DIR  --gpx-dest-db  DIR \\
+        [--dry-run]
 
-Options:
-    --fit-dest    Host directory to copy FIT files to  (default: ~/data/garminnostra/fit/vinz)
-    --gpx-dest    Host directory to copy GPX files to  (default: ~/data/garminnostra/gpx/vinz)
-    --fit-dest-db Container path prefix for FIT files  (default: /data/fit/vinz)
-    --gpx-dest-db Container path prefix for GPX files  (default: /data/gpx/vinz)
-    --dry-run     Report what would happen without writing anything
+Example (typical setup):
+    python fix_strava_paths.py \\
+        --db          ~/data/garminnostra/garmin_nostra.db \\
+        --strava-data ~/Nextcloud/code/Python/sport-import/strava-import/strava_data/activities \\
+        --fit-dest    ~/data/garminnostra/fit/vinz \\
+        --fit-dest-db /data/fit/vinz \\
+        --gpx-dest    ~/data/garminnostra/gpx/vinz \\
+        --gpx-dest-db /data/gpx/vinz \\
+        --dry-run
 """
 
 import argparse
@@ -23,27 +34,26 @@ import sqlite3
 import sys
 from pathlib import Path
 
-STRAVA_PREFIX = "/home/vinz/bin/sport_import/strava-import/strava_data/"
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--db", required=True, help="Path to SQLite database")
-    parser.add_argument("--fit-dest",    required=True, metavar="DIR",
-                        help="Host directory to copy FIT files into.")
-    parser.add_argument("--gpx-dest",    required=True, metavar="DIR",
-                        help="Host directory to copy GPX files into.")
-    parser.add_argument("--fit-dest-db", required=True, metavar="DIR",
-                        help="Path prefix stored in the DB for FIT files (container path).")
-    parser.add_argument("--gpx-dest-db", required=True, metavar="DIR",
-                        help="Path prefix stored in the DB for GPX files (container path).")
+    parser.add_argument("--db",           required=True, metavar="FILE", help="SQLite database path")
+    parser.add_argument("--strava-data",  default=None,  metavar="DIR",  help="Strava dump activities folder (source of missing files). If omitted, files not already at the destination are reported as NOT FOUND.")
+    parser.add_argument("--fit-dest",     required=True, metavar="DIR",  help="Host directory to copy FIT files into")
+    parser.add_argument("--fit-dest-db",  required=True, metavar="DIR",  help="Container path prefix for FIT files stored in DB")
+    parser.add_argument("--gpx-dest",     required=True, metavar="DIR",  help="Host directory to copy GPX files into")
+    parser.add_argument("--gpx-dest-db",  required=True, metavar="DIR",  help="Container path prefix for GPX files stored in DB")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
+    strava_data = Path(args.strava_data).expanduser() if args.strava_data else None
     fit_dest    = Path(args.fit_dest).expanduser()
     gpx_dest    = Path(args.gpx_dest).expanduser()
     fit_dest_db = Path(args.fit_dest_db)
     gpx_dest_db = Path(args.gpx_dest_db)
+
+    if strava_data and not strava_data.is_dir():
+        sys.exit(f"ERROR: --strava-data directory not found: {strava_data}")
 
     conn = sqlite3.connect(args.db)
     conn.row_factory = sqlite3.Row
@@ -56,55 +66,57 @@ def main() -> None:
     }
 
     for col, (dest_host, dest_db) in columns.items():
+        container_prefix = str(dest_db)
         rows = conn.execute(
-            f"SELECT id, {col} FROM activities WHERE {col} LIKE ?",
-            (STRAVA_PREFIX + "%",),
+            f"SELECT id, {col} FROM activities WHERE {col} IS NOT NULL AND {col} NOT LIKE ?",
+            (container_prefix + "/%",),
         ).fetchall()
 
         if not rows:
             print(f"{col}: nothing to fix")
             continue
 
-        print(f"{col}: {len(rows)} rows to process")
+        print(f"{col}: {len(rows)} rows with non-container paths")
 
-        copied = already_there = missing_source = errors = 0
+        copied = pointer_fixed = not_found = errors = 0
 
         for row in rows:
-            src = Path(row[col])
-            filename = src.name
+            filename     = Path(row[col]).name
             dest_path_host = dest_host / filename
             dest_path_db   = str(dest_db / filename)
 
-            if not src.exists():
-                print(f"  SOURCE MISSING  {src}")
-                missing_source += 1
-                continue
-
+            # 1. File already at correct destination on host
             if dest_path_host.exists():
-                # File already at destination — just fix the DB pointer
                 if not args.dry_run:
                     conn.execute(f"UPDATE activities SET {col} = ? WHERE id = ?", (dest_path_db, row["id"]))
-                print(f"  POINTER-FIX   {filename}  →  {dest_path_db}")
-                already_there += 1
+                print(f"  POINTER-FIX  {filename}")
+                pointer_fixed += 1
                 continue
 
-            # Copy and update
-            if not args.dry_run:
-                dest_host.mkdir(parents=True, exist_ok=True)
-                try:
-                    shutil.copy2(src, dest_path_host)
-                    conn.execute(f"UPDATE activities SET {col} = ? WHERE id = ?", (dest_path_db, row["id"]))
-                except Exception as exc:
-                    print(f"  ERROR  {filename}: {exc}", file=sys.stderr)
-                    errors += 1
-                    continue
-            print(f"  COPIED        {src.name}  →  {dest_path_db}")
-            copied += 1
+            # 2. File found in strava_data folder (if provided)
+            src = (strava_data / filename) if strava_data else None
+            if src and src.exists():
+                if not args.dry_run:
+                    dest_host.mkdir(parents=True, exist_ok=True)
+                    try:
+                        shutil.copy2(src, dest_path_host)
+                        conn.execute(f"UPDATE activities SET {col} = ? WHERE id = ?", (dest_path_db, row["id"]))
+                    except Exception as exc:
+                        print(f"  ERROR  {filename}: {exc}", file=sys.stderr)
+                        errors += 1
+                        continue
+                print(f"  COPIED       {filename}  (was: {row[col]})")
+                copied += 1
+                continue
+
+            # 3. Cannot locate file
+            print(f"  NOT FOUND    {filename}  (was: {row[col]})")
+            not_found += 1
 
         if not args.dry_run:
             conn.commit()
 
-        print(f"  → copied: {copied}, pointer-fixed: {already_there}, source missing: {missing_source}, errors: {errors}")
+        print(f"  → pointer-fixed: {pointer_fixed}, copied: {copied}, not found: {not_found}, errors: {errors}")
 
     conn.close()
     if args.dry_run:

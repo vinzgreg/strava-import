@@ -508,22 +508,25 @@ dump folder (`~/bin/sport_import/strava-import/strava_data/`), copies each
 file to the correct destination directory, and rewrites the DB path to the
 container-internal path.
 
-All four destination arguments are required (no defaults — paths are installation-specific):
+The four destination arguments are required; `--strava-data` is optional. Without it the script still fixes pointers for files already at the destination, and reports files it cannot locate as NOT FOUND.
 
 ```bash
+# On the machine that has the Strava dump (copies missing files + fixes pointers)
 python3 fix_strava_paths.py \
-    --db ~/data/garminnostra/garmin_nostra.db \
-    --fit-dest ~/data/garminnostra/fit/vinz \
+    --db          ~/data/garminnostra/garmin_nostra.db \
+    --strava-data ~/Nextcloud/code/Python/sport-import/strava-import/strava_data/activities \
+    --fit-dest    ~/data/garminnostra/fit/vinz \
     --fit-dest-db /data/fit/vinz \
-    --gpx-dest ~/data/garminnostra/gpx/vinz \
+    --gpx-dest    ~/data/garminnostra/gpx/vinz \
     --gpx-dest-db /data/gpx/vinz \
     --dry-run
 
+# On a machine without the Strava dump (fixes pointers only, reports missing)
 python3 fix_strava_paths.py \
-    --db ~/data/garminnostra/garmin_nostra.db \
-    --fit-dest ~/data/garminnostra/fit/vinz \
+    --db          ~/data/garminnostra/garmin_nostra.db \
+    --fit-dest    ~/data/garminnostra/fit/vinz \
     --fit-dest-db /data/fit/vinz \
-    --gpx-dest ~/data/garminnostra/gpx/vinz \
+    --gpx-dest    ~/data/garminnostra/gpx/vinz \
     --gpx-dest-db /data/gpx/vinz
 ```
 
