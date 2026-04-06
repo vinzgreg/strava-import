@@ -60,8 +60,42 @@
     /* ── Social card canvas ─────────────────────────────────────── */
     #socialCanvas { max-width: 100%; border-radius: .5rem; }
 
+    /* ── Top activities list ────────────────────────────────────── */
+    .activity-list-item {
+      display: flex;
+      align-items: baseline;
+      gap: .5rem;
+      padding: .45rem 0;
+      border-bottom: 1px solid var(--border-color);
+      font-size: .85rem;
+      color: #c8d0e0;
+    }
+    .activity-list-item:last-child { border-bottom: none; }
+    .activity-list-item .rank { color: var(--accent); font-weight: 700; min-width: 1.5rem; }
+    .activity-list-item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .activity-list-item .date { color: #64748b; white-space: nowrap; }
+    .activity-list-item .dist { color: var(--accent); font-weight: 600; white-space: nowrap; }
+
     /* ── Empty state ────────────────────────────────────────────── */
     #empty-state { color: #64748b; }
+
+    /* ── Mobile optimizations ──────────────────────────────────── */
+    @media (max-width: 576px) {
+      #filter-bar { padding: .5rem .75rem; }
+      #filter-bar .form-label { font-size: .7rem; }
+      .container-fluid { padding-left: .75rem !important; padding-right: .75rem !important; }
+      .stat-card { padding: .75rem .75rem; }
+      .stat-card .value { font-size: 1.35rem; }
+      .stat-card .label { font-size: .65rem; }
+      .stat-card .sub { font-size: .7rem; }
+      .chart-card { padding: .75rem .5rem; }
+      .chart-title { font-size: .75rem; }
+      #chart-distance, #chart-pace, #chart-elev { height: auto !important; }
+      .activity-list-item { font-size: .78rem; gap: .35rem; }
+      .activity-list-item .name { font-size: .75rem; }
+      .navbar { padding: .4rem .75rem !important; }
+      .navbar-brand { font-size: 1rem !important; }
+    }
   </style>
 </head>
 <body>
@@ -215,6 +249,22 @@
     <div class="chart-title">Elevation Gain per Period</div>
     <div class="chart-wrap">
       <canvas id="chart-elev" height="90"></canvas>
+    </div>
+  </div>
+
+  <!-- Top activities lists -->
+  <div class="row g-3 mb-3">
+    <div class="col-12 col-lg-6">
+      <div class="chart-card h-100">
+        <div class="chart-title">Top 20 Activities by Distance</div>
+        <div id="top-distance-list"></div>
+      </div>
+    </div>
+    <div class="col-12 col-lg-6" id="top-elev-card" style="display:none;">
+      <div class="chart-card h-100">
+        <div class="chart-title">Top 20 Activities by Elevation</div>
+        <div id="top-elevation-list"></div>
+      </div>
     </div>
   </div>
 
@@ -629,6 +679,42 @@ function updateTop5(data) {
   fillTable('top5-long-body', rec.top5_longest);
 }
 
+// ── Top activity lists ────────────────────────────────────────────────────
+function renderActivityList(containerId, items, valueFormatter) {
+  const container = $(containerId);
+  container.innerHTML = '';
+  if (!items || !items.length) {
+    container.innerHTML = '<div style="color:#64748b;text-align:center;padding:.5rem;">No data</div>';
+    return;
+  }
+  items.forEach((r, i) => {
+    const div = document.createElement('div');
+    div.className = 'activity-list-item';
+    const esc = s => { const d = document.createElement('span'); d.textContent = s; return d.innerHTML; };
+    div.innerHTML = `
+      <span class="rank">${i + 1}</span>
+      <span class="name" title="${esc(r.name)}">${esc(r.name)}</span>
+      <span class="date">${esc(r.date)}</span>
+      <span class="dist">${valueFormatter(r)}</span>`;
+    container.appendChild(div);
+  });
+}
+
+function updateTopLists(data) {
+  const rec = data.records || {};
+  const isCyc = data.metric_mode === 'cycling';
+
+  renderActivityList('top-distance-list', rec.top_by_distance,
+    r => r.distance_km.toLocaleString('de-DE', { maximumFractionDigits: 1 }) + ' km');
+
+  const hasElev = (rec.top_by_elevation || []).some(r => r.elevation_m > 0);
+  $('top-elev-card').style.display = (isCyc && hasElev) ? '' : 'none';
+  if (isCyc && hasElev) {
+    renderActivityList('top-elevation-list', rec.top_by_elevation,
+      r => (r.elevation_m || 0).toLocaleString('de-DE') + ' m');
+  }
+}
+
 // ── Main render ───────────────────────────────────────────────────────────
 function renderData(data) {
   currentData = data;
@@ -643,6 +729,7 @@ function renderData(data) {
   updateStatCards(data);
   updateRecords(data);
   updateTop5(data);
+  updateTopLists(data);
   buildDistanceChart(data);
   buildPaceChart(data);
   if (showElev) buildElevChart(data);

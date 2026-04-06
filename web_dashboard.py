@@ -186,13 +186,18 @@ def api_data():
             if r else None
         )
         def _row_to_dict(row):
-            return {
+            d = {
                 "name": row["activity_name"] or "—",
                 "date": (row["start_time_local"] or "")[:10],
                 "distance_km": round(float(row["distance_m"]) / 1000, 2),
                 "speed_ms": safe_float(row["avg_speed_ms"]),
                 "duration_s": int(row["duration_s"]) if row["duration_s"] else None,
             }
+            try:
+                d["elevation_m"] = int(row["elevation_gain_m"]) if row["elevation_gain_m"] else None
+            except (IndexError, KeyError):
+                pass
+            return d
         top5_fastest = [
             _row_to_dict(r) for r in db.execute(
                 f"SELECT a.activity_name, a.start_time_local, a.distance_m, a.avg_speed_ms, a.duration_s "
@@ -210,6 +215,26 @@ def api_data():
                 f"WHERE a.user_id=? AND {norm_filter} "
                 f"AND a.distance_m>0 AND a.suppressed IS NULL {year_clause} "
                 f"ORDER BY a.distance_m DESC LIMIT 5",
+                params,
+            ).fetchall()
+        ]
+        top_by_distance = [
+            _row_to_dict(r) for r in db.execute(
+                f"SELECT a.activity_name, a.start_time_local, a.distance_m, a.avg_speed_ms, a.duration_s, a.elevation_gain_m "
+                f"FROM activities a {norm_join} "
+                f"WHERE a.user_id=? AND {norm_filter} "
+                f"AND a.distance_m>0 AND a.suppressed IS NULL {year_clause} "
+                f"ORDER BY a.distance_m DESC LIMIT 20",
+                params,
+            ).fetchall()
+        ]
+        top_by_elevation = [
+            _row_to_dict(r) for r in db.execute(
+                f"SELECT a.activity_name, a.start_time_local, a.distance_m, a.avg_speed_ms, a.duration_s, a.elevation_gain_m "
+                f"FROM activities a {norm_join} "
+                f"WHERE a.user_id=? AND {norm_filter} "
+                f"AND a.elevation_gain_m>0 AND a.suppressed IS NULL {year_clause} "
+                f"ORDER BY a.elevation_gain_m DESC LIMIT 20",
                 params,
             ).fetchall()
         ]
@@ -255,6 +280,8 @@ def api_data():
             "longest": longest,
             "top5_fastest": top5_fastest,
             "top5_longest": top5_longest,
+            "top_by_distance": top_by_distance,
+            "top_by_elevation": top_by_elevation,
         },
     })
 
