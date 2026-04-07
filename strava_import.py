@@ -969,6 +969,8 @@ def import_activities(
                 f"       Run with --init-db to create it on first use."
             )
         conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
         if init_db:
             init_schema(conn)
             conn.execute("INSERT OR IGNORE INTO users (id, name) VALUES (?, 'default')", (user_id,))
@@ -1305,6 +1307,8 @@ def import_runmeter_activities(
                 f"       Run with --init-db to create it on first use."
             )
         conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
         if init_db:
             init_schema(conn)
             conn.execute("INSERT OR IGNORE INTO users (id, name) VALUES (?, 'default')", (user_id,))
@@ -1483,6 +1487,8 @@ def import_cyclemeter_activities(
                 f"       Run with --init-db to create it on first use."
             )
         conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
         if init_db:
             init_schema(conn)
             conn.execute("INSERT OR IGNORE INTO users (id, name) VALUES (?, 'default')", (user_id,))
@@ -1847,6 +1853,8 @@ def import_applehealth_activities(
                 f"       Run with --init-db to create it on first use."
             )
         conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
         if init_db:
             init_schema(conn)
             conn.execute("INSERT OR IGNORE INTO users (id, name) VALUES (?, 'default')", (user_id,))
@@ -2144,6 +2152,8 @@ def import_dailymile_activities(
                 f"       Run with --init-db to create it on first use."
             )
         conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
         if init_db:
             init_schema(conn)
             conn.execute("INSERT OR IGNORE INTO users (id, name) VALUES (?, 'default')", (user_id,))
@@ -2479,6 +2489,8 @@ def import_garminarchive_activities(
         if not db_path.exists() and not init_db:
             sys.exit(f"ERROR: database not found: {db_path}\nRun with --init-db to create it.")
         conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
         if init_db:
             init_schema(conn)
             conn.execute("INSERT OR IGNORE INTO users (id, name) VALUES (?, 'default')", (user_id,))
